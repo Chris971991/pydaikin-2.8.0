@@ -355,7 +355,12 @@ class DaikinBRP084(Appliance):
     @staticmethod
     def hex_to_temp(value: str, divisor=2) -> float:
         """Convert hexadecimal temperature to float."""
-        return int(value[:2], 16) / divisor
+        # Handle potential signed temperature values
+        temp_raw = int(value[:2], 16)
+        # Check if this is a signed value (for negative temps)
+        if temp_raw > 127:  # 0x7F - if MSB is set, it's negative
+            temp_raw = temp_raw - 256  # Convert from unsigned to signed
+        return temp_raw / divisor
 
     @staticmethod
     def temp_to_hex(temperature: float, divisor=2) -> str:
@@ -457,11 +462,22 @@ class DaikinBRP084(Appliance):
             self.values['mode'] = 'off' if is_off else self.MODE_MAP[mode_value]
 
             # Get temperatures
-            self.values['otemp'] = str(
-                self.hex_to_temp(
-                    self.find_value_by_pn(response, *self.get_path("outdoor_temp"))
-                )
-            )
+            try:
+                outdoor_temp_hex = self.find_value_by_pn(response, *self.get_path("outdoor_temp"))
+                if outdoor_temp_hex:
+                    _LOGGER.debug(f"Outdoor temp raw hex: {outdoor_temp_hex}")
+                    # Check if this looks like it's already a decimal value mistakenly treated as hex
+                    if len(outdoor_temp_hex) == 4 and outdoor_temp_hex.startswith('20'):
+                        # This might be the issue - value like "2080" being read as 8320 decimal
+                        # Try treating first 2 chars as signed hex
+                        self.values['otemp'] = str(self.hex_to_temp(outdoor_temp_hex[:2], divisor=2))
+                    else:
+                        self.values['otemp'] = str(self.hex_to_temp(outdoor_temp_hex, divisor=2))
+                else:
+                    self.values['otemp'] = "--"
+            except Exception as e:
+                _LOGGER.error(f"Error parsing outdoor temperature: {e}")
+                self.values['otemp'] = "--"
 
             self.values['htemp'] = str(
                 self.hex_to_temp(
