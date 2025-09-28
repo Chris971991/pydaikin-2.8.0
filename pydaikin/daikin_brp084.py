@@ -350,6 +350,7 @@ class DaikinBRP084(Appliance):
         """Initialize the Daikin appliance for firmware 2.8.0."""
         super().__init__(device_id, session)
         self.url = f"{self.base_url}/dsiot/multireq"
+        self._last_temp_adjustment = None
 
     @staticmethod
     def hex_to_temp(value: str, divisor=2) -> float:
@@ -547,6 +548,92 @@ class DaikinBRP084(Appliance):
             _LOGGER.debug("Error in _get_resource: %s", e)
             raise
 
+    def _validate_response(self, response: Dict):
+        """Validate response status codes from device."""
+        if not response or 'responses' not in response:
+            raise DaikinException("Invalid response format from device")
+
+        for resp in response['responses']:
+            rsc = resp.get('rsc')
+            if rsc is None:
+                continue
+
+            if rsc in (2000, 2004):
+                continue  # Success codes
+            elif rsc == 4000:
+                fr = resp.get('fr', 'unknown')
+                raise DaikinException(f"Device rejected request to {fr} (error code: {rsc})")
+            else:
+                fr = resp.get('fr', 'unknown')
+                raise DaikinException(f"Device error for {fr}: code {rsc}")
+
+    async def _set_temperature_with_clipping(self, target_temp: float) -> float:
+        """Set temperature with smart clipping to nearest valid value."""
+        if self.values['mode'] not in self.API_PATHS["temp_settings"]:
+            raise DaikinException(f"Temperature setting not supported in mode: {self.values['mode']}")
+
+        path = self.get_path("temp_settings", self.values['mode'])
+
+        # Try the exact temperature first
+        try:
+            await self._try_set_temperature(path, target_temp)
+            # Update status after successful setting
+            await self.update_status()
+            return target_temp
+        except DaikinException as e:
+            if "error code: 4000" not in str(e):
+                raise  # Re-raise non-temperature-range errors
+
+        # If exact temp failed, try clipping upward first (toward warmer temps)
+        # This handles the common case where requested temp is too cold
+        try:
+            final_temp = await self._search_valid_temperature(path, target_temp, direction=1)
+            await self.update_status()
+            return final_temp
+        except DaikinException:
+            # If that fails, try downward (toward cooler temps)
+            final_temp = await self._search_valid_temperature(path, target_temp, direction=-1)
+            await self.update_status()
+            return final_temp
+
+    async def _try_set_temperature(self, path: List[str], temperature: float):
+        """Try to set a specific temperature."""
+        requests = []
+        temp_hex = self.temp_to_hex(temperature)
+        self.add_request(requests, path, temp_hex)
+
+        request_payload = DaikinRequest(requests).serialize()
+        _LOGGER.debug("Trying temperature %.1f°C", temperature)
+        response = await self._get_resource("", params=request_payload)
+        self._validate_response(response)
+
+    async def _search_valid_temperature(self, path: List[str], start_temp: float, direction: int) -> float:
+        """Search for a valid temperature in the given direction."""
+        # Reasonable temperature bounds (most AC units support 16-30°C)
+        min_temp, max_temp = 16.0, 30.0
+        current_temp = start_temp
+
+        # Try up to 15 temperature steps (should cover most ranges)
+        for _ in range(15):
+            current_temp += direction * 0.5  # Try half-degree increments
+
+            if current_temp < min_temp or current_temp > max_temp:
+                break
+
+            try:
+                await self._try_set_temperature(path, current_temp)
+                return current_temp
+            except DaikinException as e:
+                if "error code: 4000" not in str(e):
+                    raise  # Re-raise non-temperature-range errors
+                continue
+
+        # If we get here, no valid temperature was found
+        raise DaikinException(
+            f"No valid temperature found near {start_temp:.1f}°C. "
+            f"Device may have limited temperature range in {self.values['mode']} mode."
+        )
+
     async def _update_settings(self, settings):
         """Update settings to set on Daikin device."""
         # Start with current values
@@ -657,9 +744,28 @@ class DaikinBRP084(Appliance):
     async def set(self, settings):
         """Set settings on Daikin device."""
         await self._update_settings(settings)
-        requests = []
 
-        # Handle different types of settings
+        # Handle temperature setting with smart clipping if other settings exist
+        has_temp_setting = 'stemp' in settings
+        has_other_settings = any(key != 'stemp' for key in settings.keys())
+
+        if has_temp_setting and not has_other_settings:
+            # Temperature-only setting - use smart clipping
+            requested_temp = float(settings['stemp'])
+            final_temp = await self._set_temperature_with_clipping(requested_temp)
+            if final_temp != requested_temp:
+                self._last_temp_adjustment = {
+                    'requested': requested_temp,
+                    'actual': final_temp,
+                    'message': f"Temperature adjusted from {requested_temp:.1f}°C to {final_temp:.1f}°C (nearest available)"
+                }
+                _LOGGER.info(self._last_temp_adjustment['message'])
+            else:
+                self._last_temp_adjustment = None
+            return  # Exit early for temperature-only settings
+
+        # Handle other settings normally
+        requests = []
         self._handle_power_setting(settings, requests)
         self._handle_temperature_setting(settings, requests)
         self._handle_fan_setting(settings, requests)
@@ -670,6 +776,9 @@ class DaikinBRP084(Appliance):
             _LOGGER.debug("Sending request: %s", request_payload)
             response = await self._get_resource("", params=request_payload)
             _LOGGER.debug("Response: %s", response)
+
+            # Validate response status codes
+            self._validate_response(response)
 
             # Update status after setting
             await self.update_status()
@@ -703,3 +812,14 @@ class DaikinBRP084(Appliance):
     def support_zone_count(self) -> bool:
         """Zones mode not supported in firmware 2.8.0"""
         return False
+
+    @property
+    def last_temperature_adjustment(self) -> Optional[Dict]:
+        """Return information about the last temperature adjustment, if any."""
+        return self._last_temp_adjustment
+
+    def get_temperature_adjustment_message(self) -> Optional[str]:
+        """Return a user-friendly message about the last temperature adjustment."""
+        if self._last_temp_adjustment:
+            return self._last_temp_adjustment['message']
+        return None
