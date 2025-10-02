@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit -m \"$(cat <<''EOF''\nOptimize temperature clipping for faster response\n\nImproved temperature search algorithm with quick tries:\n- First attempts common offsets (±0.5°C, ±1.0°C)\n- Covers 95% of cases in 1-4 tries instead of 5-15\n- Reduces max iterations from 15 to 10\n- Results in 3-5x faster temperature clipping\n\nPerformance improvement: 2-30s → 0.3-2s for temperature changes\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Read(//c/Users/Chris/**)",
+      "Bash(curl:*)",
+      "Bash(arp:*)",
+      "Bash(for:*)",
+      "Bash(do echo \"Testing $ip...\")",
+      "Bash(timeout:*)",
+      "Bash(timeout 2 curl -s \"http://$ip/dsiot/multireq\" -X POST -H \"Content-Type: application/json\" -d '{\"\"\"\"requests\"\"\"\":[{\"\"\"\"op\"\"\"\":2,\"\"\"\"to\"\"\"\":\"\"\"\"/dsiot/edge.adp_i\"\"\"\"}]}')",
+      "Bash(done)",
+      "Bash(do echo \"=== Testing $ip ===\")",
+      "Bash(git init:*)",
+      "Bash(gh:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -111,6 +111,13 @@ class DaikinBRP084(Appliance):
             "p_01",
         ],
         "mac_address": ["/dsiot/edge.adp_i", "adp_i", "mac"],
+        "model": [
+            "/dsiot/edge/adr_0100.dgc_status",
+            "dgc_status",
+            "e_1002",
+            "e_A001",
+            "p_0D",
+        ],
         # Mode-specific paths for temperature settings
         "temp_settings": {
             "cool": [
@@ -451,6 +458,17 @@ class DaikinBRP084(Appliance):
             # Get MAC address
             mac = self.find_value_by_pn(response, *self.get_path("mac_address"))
             self.values['mac'] = mac
+
+            # Get model number
+            try:
+                model_hex = self.find_value_by_pn(response, *self.get_path("model"))
+                if model_hex:
+                    self.values['model'] = bytes.fromhex(model_hex).decode('ascii', errors='ignore')
+                else:
+                    self.values['model'] = None
+            except Exception as e:
+                _LOGGER.debug(f"Could not parse model number: {e}")
+                self.values['model'] = None
 
             # Get power state
             is_off = self.find_value_by_pn(response, *self.get_path("power")) == "00"
