@@ -464,10 +464,12 @@ class DaikinBRP084(Appliance):
                 model_hex = self.find_value_by_pn(response, *self.get_path("model"))
                 if model_hex:
                     self.values['model'] = bytes.fromhex(model_hex).decode('ascii', errors='ignore')
+                    _LOGGER.info(f"Extracted model: {self.values['model']} from hex: {model_hex}")
                 else:
                     self.values['model'] = None
+                    _LOGGER.warning("Model hex was empty or None")
             except Exception as e:
-                _LOGGER.debug(f"Could not parse model number: {e}")
+                _LOGGER.error(f"Could not parse model number: {e}")
                 self.values['model'] = None
 
             # Get power state
