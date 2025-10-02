@@ -38,6 +38,13 @@ class DaikinBRP072C(DaikinBRP069):
         self.ssl_context.options |= 0x4
         self.ssl_context.check_hostname = False
         self.ssl_context.verify_mode = ssl.CERT_NONE
+        # Lower security level to allow legacy Daikin SSL/TLS configurations
+        # Fixes HA 2025.10 SSL WRONG_SIGNATURE_TYPE error
+        # See: https://github.com/home-assistant/core/issues/153385
+        try:
+            self.ssl_context.set_ciphers('DEFAULT:@SECLEVEL=0')
+        except Exception:
+            pass  # Fallback for systems that don't support SECLEVEL
         self.base_url = f"https://{self.device_ip}"
 
     async def init(self):

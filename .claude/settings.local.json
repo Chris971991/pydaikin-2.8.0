@@ -14,7 +14,9 @@
       "Bash(done)",
       "Bash(do echo \"=== Testing $ip ===\")",
       "Bash(git init:*)",
-      "Bash(gh:*)"
+      "Bash(gh:*)",
+      "Bash(ssh:*)",
+      "Read(//c/192.168.50.45/config/custom_components/**)"
     ],
     "deny": [],
     "ask": []
