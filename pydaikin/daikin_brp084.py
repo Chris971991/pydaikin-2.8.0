@@ -854,3 +854,30 @@ class DaikinBRP084(Appliance):
         if self._last_temp_adjustment:
             return self._last_temp_adjustment['message']
         return None
+
+    @property
+    def inside_temperature(self) -> Optional[float]:
+        """Return current indoor temperature (for compatibility with official HA integration)."""
+        try:
+            return float(self.values.get('htemp', 0))
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def target_temperature(self) -> Optional[float]:
+        """Return target temperature (for compatibility with official HA integration)."""
+        try:
+            return float(self.values.get('stemp', 0))
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def outside_temperature(self) -> Optional[float]:
+        """Return outdoor temperature (for compatibility with official HA integration)."""
+        try:
+            otemp = self.values.get('otemp', '--')
+            if otemp == '--':
+                return None
+            return float(otemp)
+        except (ValueError, TypeError):
+            return None
