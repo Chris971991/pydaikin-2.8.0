@@ -624,14 +624,29 @@ class DaikinBRP084(Appliance):
         self._validate_response(response)
 
     async def _search_valid_temperature(self, path: List[str], start_temp: float, direction: int) -> float:
-        """Search for a valid temperature in the given direction."""
+        """Search for a valid temperature in the given direction using optimized binary search."""
         # Reasonable temperature bounds (most AC units support 16-30°C)
         min_temp, max_temp = 16.0, 30.0
-        current_temp = start_temp
 
-        # Try up to 15 temperature steps (should cover most ranges)
-        for _ in range(15):
-            current_temp += direction * 0.5  # Try half-degree increments
+        # First, try just a few nearby temperatures (most likely to succeed)
+        # This handles the common case where device rounds to nearest 0.5 or 1.0
+        quick_tries = [0.5, 1.0, -0.5, -1.0] if direction > 0 else [-0.5, -1.0, 0.5, 1.0]
+
+        for offset in quick_tries:
+            test_temp = start_temp + offset
+            if min_temp <= test_temp <= max_temp:
+                try:
+                    await self._try_set_temperature(path, test_temp)
+                    return test_temp
+                except DaikinException as e:
+                    if "error code: 4000" not in str(e):
+                        raise
+                    continue
+
+        # If quick tries failed, do a linear search in the specified direction
+        current_temp = start_temp
+        for _ in range(10):  # Reduced from 15 for faster failure
+            current_temp += direction * 0.5
 
             if current_temp < min_temp or current_temp > max_temp:
                 break
@@ -641,7 +656,7 @@ class DaikinBRP084(Appliance):
                 return current_temp
             except DaikinException as e:
                 if "error code: 4000" not in str(e):
-                    raise  # Re-raise non-temperature-range errors
+                    raise
                 continue
 
         # If we get here, no valid temperature was found
