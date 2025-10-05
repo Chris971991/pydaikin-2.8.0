@@ -450,13 +450,15 @@ class DaikinBRP084(Appliance):
 
             if not response or 'responses' not in response:
                 raise DaikinException("Invalid response from device")
-        except asyncio.TimeoutError as e:
+        except asyncio.TimeoutError:
             _LOGGER.error("Timeout communicating with device")
-            raise DaikinException("Failed to communicate with device: timeout") from e
+            raise DaikinException("Timeout communicating with device")
+        except DaikinException:
+            raise  # Re-raise DaikinException as-is
         except Exception as e:
-            error_msg = str(e) if str(e) else type(e).__name__
+            error_msg = str(e) or type(e).__name__
             _LOGGER.error("Error communicating with device: %s", error_msg)
-            raise DaikinException(f"Failed to communicate with device: {error_msg}") from e
+            raise DaikinException(f"Error communicating with device: {error_msg}") from e
 
         # Extract basic info
         try:
