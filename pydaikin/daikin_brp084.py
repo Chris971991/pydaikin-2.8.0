@@ -456,7 +456,9 @@ class DaikinBRP084(Appliance):
         except DaikinException:
             raise  # Re-raise DaikinException as-is
         except Exception as e:
-            error_msg = str(e) or type(e).__name__
+            error_msg = str(e).strip()
+            if not error_msg:
+                error_msg = type(e).__name__
             _LOGGER.error("Error communicating with device: %s", error_msg)
             raise DaikinException(f"Error communicating with device: {error_msg}") from e
 
