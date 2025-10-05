@@ -1,5 +1,6 @@
 """Pydaikin appliance, represent a Daikin BRP device with firmware 2.8.0."""
 
+import asyncio
 from dataclasses import dataclass, field
 import json
 import logging
@@ -449,9 +450,13 @@ class DaikinBRP084(Appliance):
 
             if not response or 'responses' not in response:
                 raise DaikinException("Invalid response from device")
+        except asyncio.TimeoutError as e:
+            _LOGGER.error("Timeout communicating with device")
+            raise DaikinException("Failed to communicate with device: timeout") from e
         except Exception as e:
-            _LOGGER.error("Error communicating with device: %s", e)
-            raise DaikinException(f"Failed to communicate with device: {e}") from e
+            error_msg = str(e) if str(e) else type(e).__name__
+            _LOGGER.error("Error communicating with device: %s", error_msg)
+            raise DaikinException(f"Failed to communicate with device: {error_msg}") from e
 
         # Extract basic info
         try:
