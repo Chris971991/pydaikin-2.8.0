@@ -142,11 +142,14 @@ class DaikinBRP069(Appliance):
 
     async def init(self):
         """Init status."""
-        await self.auto_set_clock()
-        if self.values:
-            await self.update_status(self.HTTP_RESOURCES[1:])
-        else:
-            await self.update_status(self.HTTP_RESOURCES)
+        # Only fetch essential info during init for faster startup
+        # The coordinator will fetch full status afterwards
+        essential_resources = [
+            'common/basic_info',
+            'aircon/get_sensor_info',
+            'aircon/get_control_info',
+        ]
+        await self.update_status(essential_resources)
 
     def get_info_resources(self):
         """Returns info_resources"""

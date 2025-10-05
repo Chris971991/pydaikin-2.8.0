@@ -20,7 +20,8 @@
       "Bash(git tag:*)",
       "Bash(git add:*)",
       "Bash(cat:*)",
-      "Read(//c/192.168.50.45/config//**)"
+      "Read(//c/192.168.50.45/config//**)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []
