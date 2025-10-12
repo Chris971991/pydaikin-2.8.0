@@ -450,17 +450,25 @@ class DaikinBRP084(Appliance):
 
             if not response or 'responses' not in response:
                 raise DaikinException("Invalid response from device")
-        except asyncio.TimeoutError:
-            _LOGGER.error("Timeout communicating with device")
-            raise DaikinException("Timeout communicating with device")
+        except asyncio.TimeoutError as e:
+            _LOGGER.error("Timeout communicating with device at %s", self.device_id)
+            raise DaikinException(f"Timeout communicating with device at {self.device_id}") from e
         except DaikinException:
             raise  # Re-raise DaikinException as-is
         except Exception as e:
             error_msg = str(e).strip()
+            error_type = type(e).__name__
             if not error_msg:
-                error_msg = type(e).__name__
-            _LOGGER.info("Error communicating with device: %s", error_msg)
-            raise DaikinException(f"Error communicating with device: {error_msg}") from e
+                error_msg = error_type
+            _LOGGER.error(
+                "Error communicating with device at %s: %s (%s)",
+                self.device_id,
+                error_msg,
+                error_type,
+            )
+            raise DaikinException(
+                f"Error communicating with device at {self.device_id}: {error_msg} ({error_type})"
+            ) from e
 
         # Extract basic info
         try:
@@ -590,7 +598,12 @@ class DaikinBRP084(Appliance):
                     response.raise_for_status()
                     return await response.json()
         except Exception as e:
-            _LOGGER.debug("Error in _get_resource: %s", e)
+            _LOGGER.error(
+                "Error in _get_resource for %s: %s (%s)",
+                self.device_id,
+                str(e),
+                type(e).__name__,
+            )
             raise
 
     def _validate_response(self, response: Dict):
