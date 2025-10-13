@@ -163,8 +163,7 @@ class DaikinPowerMixin:
         except (TypeError, IndexError, AttributeError, ValueError):
             return None
 
-    @staticmethod
-    def _compute_diff_energy(mode: str, curr, prev):
+    def _compute_diff_energy(self, mode: str, curr, prev):
         """Return the energy consumption delta between two states"""
         if curr.today > prev.today:
             # Normal behavior, today state is growing
@@ -173,8 +172,11 @@ class DaikinPowerMixin:
         if curr.yesterday is None:
             _LOGGER.error(
                 'Decreasing today state and missing yesterday state caused an '
-                'impossible energy consumption measure of %s',
+                'impossible energy consumption measure of %s on device %s (curr.today=%s, prev.today=%s)',
                 mode,
+                getattr(self, 'device_ip', 'unknown'),
+                curr.today,
+                prev.today,
             )
             return None
 
@@ -184,7 +186,15 @@ class DaikinPowerMixin:
             # to previous today state (in most cases it will be equal)
             return curr.yesterday - prev.today + curr.today
 
-        _LOGGER.error('Impossible energy consumption measure of %s', mode)
+        _LOGGER.error(
+            'Impossible energy consumption measure of %s on device %s '
+            '(curr.today=%s, prev.today=%s, curr.yesterday=%s)',
+            mode,
+            getattr(self, 'device_ip', 'unknown'),
+            curr.today,
+            prev.today,
+            curr.yesterday,
+        )
         return None
 
     def current_power_consumption(  # pylint: disable=too-many-branches
