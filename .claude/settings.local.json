@@ -22,7 +22,8 @@
       "Bash(cat:*)",
       "Read(//c/192.168.50.45/config//**)",
       "Bash(python3:*)",
-      "Bash(copy \"dist\\pydaikin-2.17.9-py3-none-any.whl\" \"\\192.168.50.45\\config\\pydaikin-2.17.9-py3-none-any.whl\")"
+      "Bash(copy \"dist\\pydaikin-2.17.9-py3-none-any.whl\" \"\\192.168.50.45\\config\\pydaikin-2.17.9-py3-none-any.whl\")",
+      "Bash(python -m build:*)"
     ],
     "deny": [],
     "ask": []

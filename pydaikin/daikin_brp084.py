@@ -597,12 +597,26 @@ class DaikinBRP084(Appliance):
                 ) as response:
                     response.raise_for_status()
                     return await response.json()
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            # Network timeout or cancellation - log as warning not error
+            _LOGGER.warning(
+                "Network timeout or cancellation communicating with device at %s: %s",
+                self.device_id,
+                type(e).__name__,
+            )
+            raise DaikinException(
+                f"Network timeout communicating with device at {self.device_id}"
+            ) from e
         except Exception as e:
+            error_msg = str(e).strip()
+            error_type = type(e).__name__
+            if not error_msg:
+                error_msg = error_type
             _LOGGER.error(
                 "Error in _get_resource for %s: %s (%s)",
                 self.device_id,
-                str(e),
-                type(e).__name__,
+                error_msg,
+                error_type,
             )
             raise
 
