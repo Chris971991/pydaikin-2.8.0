@@ -9,11 +9,12 @@ from ssl import SSLContext
 from typing import Optional
 from urllib.parse import unquote
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 from aiohttp.client_exceptions import (
     ClientOSError,
     ClientResponseError,
     ServerDisconnectedError,
+    ServerTimeoutError,
 )
 from aiohttp.web_exceptions import HTTPForbidden
 from tenacity import (
@@ -136,6 +137,8 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
                 ClientOSError,
                 ClientResponseError,
                 ServerDisconnectedError,
+                ServerTimeoutError,
+                asyncio.TimeoutError,
             )
         ),
         before_sleep=before_sleep_log(_LOGGER, logging.DEBUG),
@@ -156,11 +159,15 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
         # cannot manage session on outer async with or this will close the session
         # passed to pydaikin (homeassistant for instance)
         async with self.request_semaphore:
+            # Set a generous timeout for slow/old devices (20 seconds total)
+            # Some older Daikin units can take 15+ seconds to respond
+            timeout = ClientTimeout(total=20)
             async with self.session.get(
                 f'{self.base_url}/{path}',
                 params=params,
                 headers=self.headers,
                 ssl=self.ssl_context,
+                timeout=timeout,
             ) as response:
                 if response.status == 403:
                     raise HTTPForbidden(reason=f"HTTP 403 Forbidden for {response.url}")
@@ -190,6 +197,7 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
         ]
         _LOGGER.debug("Updating %s", resources)
 
+        tasks_failed = False
         try:
             async with asyncio.TaskGroup() as tg:
                 tasks = [
@@ -197,11 +205,19 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
                     for resource in resources
                 ]
         except ExceptionGroup as eg:
+            tasks_failed = True
+            # Log all exceptions
             for exc in eg.exceptions:
                 _LOGGER.error("Exception in TaskGroup: %s", exc)
+            # If ALL tasks failed, we should re-raise to indicate complete failure
+            if len(eg.exceptions) == len(tasks):
+                _LOGGER.error("All resource requests failed for device %s", self.device_ip)
+                raise eg.exceptions[0] from eg
 
-        for resource, task in zip(resources, tasks):
-            self.values.update_by_resource(resource, task.result())
+        # Only process results if TaskGroup completed successfully
+        if not tasks_failed:
+            for resource, task in zip(resources, tasks):
+                self.values.update_by_resource(resource, task.result())
 
         self._register_energy_consumption_history()
 
