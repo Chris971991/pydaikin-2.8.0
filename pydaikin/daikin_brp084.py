@@ -408,10 +408,12 @@ class DaikinBRP084(Appliance):
                     )
                 )
                 self.values['stemp'] = temp_value
-                self._cached_target_temp = temp_value  # Cache temp when unit is on
+                self.values['_cached_stemp'] = temp_value  # Cache in values for persistence
+                self._cached_target_temp = temp_value  # Also cache in instance var
             else:
                 # When off, use cached temp if available, otherwise "--"
-                self.values['stemp'] = self._cached_target_temp if self._cached_target_temp else "--"
+                cached = self.values.get('_cached_stemp', invalidate=False) or self._cached_target_temp
+                self.values['stemp'] = cached if cached else "--"
 
             # Get fan mode
             if self.values['mode'] in self.API_PATHS["fan_settings"]:
@@ -804,11 +806,14 @@ class DaikinBRP084(Appliance):
     def target_temperature(self) -> Optional[float]:
         """Return target temperature (for compatibility with official HA integration)."""
         # If unit is off but we have cached temp, return it
-        if self.values.get('pow') == '0' and self._cached_target_temp:
-            try:
-                return float(self._cached_target_temp)
-            except (ValueError, TypeError):
-                pass
+        if self.values.get('pow') == '0':
+            # Try persisted cache first, then instance var cache
+            cached = self.values.get('_cached_stemp', invalidate=False) or self._cached_target_temp
+            if cached:
+                try:
+                    return float(cached)
+                except (ValueError, TypeError):
+                    pass
 
         try:
             return float(self.values.get('stemp', 0))
