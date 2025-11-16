@@ -219,8 +219,6 @@ class DaikinBRP084(Appliance):
         super().__init__(device_id, session)
         self.url = f"{self.base_url}/dsiot/multireq"
         self._last_temp_adjustment = None
-        self._cached_target_temp = None  # Cache last target temp when unit is on
-        self._pending_target_temp = None  # Store temp to apply when turning on
 
     @staticmethod
     def hex_to_temp(value: str, divisor=2) -> float:
@@ -399,7 +397,7 @@ class DaikinBRP084(Appliance):
 
             # Get target temperature
             if self.values['mode'] in self.API_PATHS["temp_settings"]:
-                temp_value = str(
+                self.values['stemp'] = str(
                     self.hex_to_temp(
                         self.find_value_by_pn(
                             response,
@@ -407,13 +405,8 @@ class DaikinBRP084(Appliance):
                         )
                     )
                 )
-                self.values['stemp'] = temp_value
-                self.values['_cached_stemp'] = temp_value  # Cache in values for persistence
-                self._cached_target_temp = temp_value  # Also cache in instance var
             else:
-                # When off, use cached temp if available, otherwise "--"
-                cached = self.values.get('_cached_stemp', invalidate=False) or self._cached_target_temp
-                self.values['stemp'] = cached if cached else "--"
+                self.values['stemp'] = "--"
 
             # Get fan mode
             if self.values['mode'] in self.API_PATHS["fan_settings"]:
@@ -603,11 +596,6 @@ class DaikinBRP084(Appliance):
             else:
                 self.values[key] = value
 
-        # Store pending temp if setting temp while off
-        if 'stemp' in settings and self.values.get('pow') == '0':
-            self._pending_target_temp = settings['stemp']
-            _LOGGER.debug("Stored pending temperature: %s", self._pending_target_temp)
-
         return self.values
 
     def add_request(self, requests, path, value):
@@ -633,12 +621,6 @@ class DaikinBRP084(Appliance):
         if mode_value:
             mode_path = self.get_path("mode")
             self.add_request(requests, mode_path, mode_value)
-
-        # Apply pending temperature when turning on
-        if self._pending_target_temp and settings['mode'] in self.API_PATHS["temp_settings"]:
-            settings['stemp'] = self._pending_target_temp
-            _LOGGER.info("Applying pending temperature %s when turning on", self._pending_target_temp)
-            self._pending_target_temp = None  # Clear after applying
 
     def _handle_temperature_setting(self, settings, requests):
         """Handle temperature-related settings."""
@@ -715,12 +697,7 @@ class DaikinBRP084(Appliance):
         has_other_settings = any(key != 'stemp' for key in settings.keys())
 
         if has_temp_setting and not has_other_settings:
-            # If setting temp while off, just store and return
-            if self.values.get('pow') == '0':
-                _LOGGER.info("Storing temperature %.1f°C to apply when unit turns on", float(settings['stemp']))
-                return  # Exit early, temp already stored in _update_settings
-
-            # Temperature-only setting while on - use smart clipping
+            # Temperature-only setting - use smart clipping
             requested_temp = float(settings['stemp'])
             final_temp = await self._set_temperature_with_clipping(requested_temp)
             if final_temp != requested_temp:
@@ -805,16 +782,6 @@ class DaikinBRP084(Appliance):
     @property
     def target_temperature(self) -> Optional[float]:
         """Return target temperature (for compatibility with official HA integration)."""
-        # If unit is off but we have cached temp, return it
-        if self.values.get('pow') == '0':
-            # Try persisted cache first, then instance var cache
-            cached = self.values.get('_cached_stemp', invalidate=False) or self._cached_target_temp
-            if cached:
-                try:
-                    return float(cached)
-                except (ValueError, TypeError):
-                    pass
-
         try:
             return float(self.values.get('stemp', 0))
         except (ValueError, TypeError):
