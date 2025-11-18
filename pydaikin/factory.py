@@ -5,6 +5,7 @@ import re
 from typing import Optional, Tuple
 
 from aiohttp import ClientSession
+from aiohttp.client_exceptions import ClientOSError
 from aiohttp.web_exceptions import HTTPNotFound
 
 from .daikin_airbase import DaikinAirBase
@@ -93,7 +94,7 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
                 )
                 if not self._generated_object.values:
                     raise DaikinException("Empty Values.")
-            except (HTTPNotFound, DaikinException) as err:
+            except (HTTPNotFound, DaikinException, ClientOSError) as err:
                 _LOGGER.debug("Falling back to AirBase: %s", err)
                 self._generated_object = DaikinAirBase(device_ip, session)
 
@@ -103,6 +104,13 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
                     self._generated_object.base_url = (
                         f"http://{device_ip}:{device_port}"
                     )
+
+                # Pre-populate values before calling init() to avoid "Empty values" error
+                await self._generated_object.update_status(
+                    self._generated_object.HTTP_RESOURCES[:1]
+                )
+                if not self._generated_object.values:
+                    raise DaikinException("Failed to communicate with AirBase device.")
 
         await self._generated_object.init()
 
