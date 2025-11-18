@@ -243,6 +243,11 @@ class DaikinBRP084(Appliance):
     @staticmethod
     def find_value_by_pn(data: dict, fr: str, *keys):
         """Find values in nested response data."""
+        if data is None:
+            raise DaikinException("Response data is None")
+        if 'responses' not in data:
+            raise DaikinException("No 'responses' key in data")
+
         data = [x['pc'] for x in data['responses'] if x['fr'] == fr]
 
         while keys:
@@ -456,7 +461,10 @@ class DaikinBRP084(Appliance):
                     timeout=5,  # Add a timeout to avoid hanging
                 ) as response:
                     response.raise_for_status()
-                    return await response.json()
+                    json_data = await response.json()
+                    if json_data is None:
+                        raise DaikinException("Device returned null/empty JSON response")
+                    return json_data
         except (asyncio.TimeoutError, asyncio.CancelledError) as e:
             # Network timeout or cancellation - log as warning not error
             _LOGGER.warning(
