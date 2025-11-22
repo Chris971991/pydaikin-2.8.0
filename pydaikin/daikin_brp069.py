@@ -220,6 +220,9 @@ class DaikinBRP069(Appliance):
         _LOGGER.debug("Sending request to %s with params: %s", path, params)
         await self._get_resource(path, params)
 
+        # Update status after setting to get the latest device state
+        await self.update_status()
+
     async def set_holiday(self, mode):
         """Set holiday mode."""
         value = self.human_to_daikin('en_hol', mode)

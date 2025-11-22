@@ -10,3 +10,6 @@ __pycache__
 venv/
 .coverage
 .vscode
+test_response_time.py
+check_office.py
+.claude/settings.local.json

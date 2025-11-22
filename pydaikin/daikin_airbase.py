@@ -67,7 +67,7 @@ class DaikinAirBase(DaikinBRP069):
         """Init status and set defaults."""
         await super().init()
         if not self.values:
-            raise DaikinException("Not an AirBase device")
+            raise DaikinException("Empty values.")
         self.values.update({**self.DEFAULTS, **self.values})
         # Friendly display the model
         if self.values.get("model", None) == "NOTSUPPORT":
