@@ -21,10 +21,8 @@ class ApplianceValues(MutableMapping):
     # --- Implementation of abstract methods ---
 
     def __getitem__(self, key):
-        # Everytime a value is read, the associated resource is deprecated and should be updated
-        resource = self._resource_by_key.get(key)
-        if resource is not None:
-            self._last_update_by_resource.pop(resource, None)
+        # Return the value without invalidating - use get(key, invalidate=True) to force refresh
+        # Previously this invalidated on every read, causing excessive API calls
         return self._data[key]
 
     def __setitem__(self, key, value):
