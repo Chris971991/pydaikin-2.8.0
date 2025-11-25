@@ -106,11 +106,24 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
                     )
 
                 # Pre-populate values before calling init() to avoid "Empty values" error
-                await self._generated_object.update_status(
-                    self._generated_object.HTTP_RESOURCES[:1]
-                )
-                if not self._generated_object.values:
-                    raise DaikinException("Failed to communicate with AirBase device.")
+                try:
+                    await self._generated_object.update_status(
+                        self._generated_object.HTTP_RESOURCES[:1]
+                    )
+                    if not self._generated_object.values:
+                        raise DaikinException(
+                            f"Device at {device_ip} is not responding. "
+                            "The device may be offline or unreachable. "
+                            "Please check the device network connection and try again."
+                        )
+                except (HTTPNotFound, DaikinException, ClientOSError) as airbase_err:
+                    # All device types failed - device is likely offline
+                    raise DaikinException(
+                        f"Unable to connect to Daikin device at {device_ip}. "
+                        f"The device appears to be offline or unreachable. "
+                        f"Tried BRP084, BRP069, and AirBase protocols. "
+                        f"Last error: {airbase_err}"
+                    ) from airbase_err
 
         await self._generated_object.init()
 

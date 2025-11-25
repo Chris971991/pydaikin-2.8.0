@@ -738,6 +738,22 @@ class DaikinBRP084(Appliance):
             # Update status after setting
             await self.update_status()
 
+            # Verify power state actually changed for on/off commands
+            if 'mode' in settings:
+                expected_pow = '0' if settings['mode'] == 'off' else '1'
+                actual_pow = self.values.get('pow')
+                if actual_pow != expected_pow:
+                    _LOGGER.error(
+                        "Power state verification failed! Expected pow=%s, got pow=%s. "
+                        "Device may have ignored the command.",
+                        expected_pow, actual_pow
+                    )
+                    raise DaikinException(
+                        f"Device did not change power state. "
+                        f"Expected: {'off' if expected_pow == '0' else 'on'}, "
+                        f"Actual: {'off' if actual_pow == '0' else 'on'}"
+                    )
+
     # pylint: disable=unused-argument
     async def set_streamer(self, mode):
         """Streamer mode not supported in firmware 2.8.0"""
