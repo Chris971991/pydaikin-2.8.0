@@ -263,6 +263,22 @@ class DaikinBRP069(Appliance):
                 'aborted': True  # Signal that command was NOT sent
             }
 
+        # Physical remote turn-ON detection (symmetric to turn-OFF):
+        # If caller expected device to be OFF (expected_pow='0') but device is ON,
+        # someone used the physical remote to turn ON the AC. ABORT the command.
+        device_was_on = current_val.get('pow') == '1'
+        if expected_pow == '0' and device_was_on:
+            _LOGGER.warning(
+                "set() PHYSICAL REMOTE TURN-ON [%s]: Expected pow=0 but device reports pow=1. "
+                "ABORTING command - user turned ON AC via physical remote.",
+                device_ip
+            )
+            return {
+                'detected_power_on': True,
+                'current_val': current_val,
+                'aborted': True  # Signal that command was NOT sent
+            }
+
         path = 'aircon/set_control_info'
         params = {
             "mode": self.values["mode"],
