@@ -167,9 +167,10 @@ class DaikinBRP069(Appliance):
         resource = 'aircon/get_control_info'
         current_val = await self._get_resource(resource)
 
+        device_ip = getattr(self, 'device_ip', None) or getattr(self, '_device_ip', 'unknown')
         _LOGGER.warning(
-            "_update_settings ENTRY: settings=%s, current_val.pow=%s",
-            settings, current_val.get('pow')
+            "_update_settings ENTRY [%s]: settings=%s, current_val.pow=%s",
+            device_ip, settings, current_val.get('pow')
         )
 
         # Merge current_val with mapped settings
@@ -179,14 +180,14 @@ class DaikinBRP069(Appliance):
         )
 
         _LOGGER.warning(
-            "_update_settings AFTER MERGE: self.values.pow=%s, 'mode' in settings=%s, settings.get('mode')=%s",
-            self.values.get('pow'), 'mode' in settings, settings.get('mode')
+            "_update_settings AFTER MERGE [%s]: self.values.pow=%s, 'mode' in settings=%s, settings.get('mode')=%s",
+            device_ip, self.values.get('pow'), 'mode' in settings, settings.get('mode')
         )
 
         # we are using an extra mode "off" to power off the unit
         if settings.get('mode', '') == 'off':
             self.values['pow'] = '0'
-            _LOGGER.warning("_update_settings: MODE IS OFF -> pow=0")
+            _LOGGER.warning("_update_settings [%s]: MODE IS OFF -> pow=0", device_ip)
             # some units are picky with the off mode
             self.values['mode'] = current_val['mode']
 
@@ -194,7 +195,7 @@ class DaikinBRP069(Appliance):
         # powered on OR if the request is empty power on
         elif 'mode' in settings or not settings:
             self.values['pow'] = '1'
-            _LOGGER.warning("_update_settings: MODE IN SETTINGS OR EMPTY -> pow=1")
+            _LOGGER.warning("_update_settings [%s]: MODE IN SETTINGS OR EMPTY -> pow=1", device_ip)
 
         # FIX: If changing temperature, fan, or swing while device is off and mode is
         # not being changed to 'off', we need to power on the device.
@@ -206,11 +207,11 @@ class DaikinBRP069(Appliance):
             if any(k in settings for k in operational_settings):
                 self.values['pow'] = '1'
                 _LOGGER.warning(
-                    "_update_settings: AUTO-POWER-ON: settings=%s contained operational params -> pow=1",
-                    list(settings.keys())
+                    "_update_settings [%s]: AUTO-POWER-ON: settings=%s contained operational params -> pow=1",
+                    device_ip, list(settings.keys())
                 )
 
-        _LOGGER.warning("_update_settings EXIT: final pow=%s", self.values.get('pow'))
+        _LOGGER.warning("_update_settings EXIT [%s]: final pow=%s", device_ip, self.values.get('pow'))
 
         # Use settings for respecitve mode (dh and dt)
         for k, val in {'stemp': 'dt', 'shum': 'dh', 'f_rate': 'dfr'}.items():
