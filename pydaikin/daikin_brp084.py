@@ -316,8 +316,8 @@ class DaikinBRP084(Appliance):
             if not response or 'responses' not in response:
                 raise DaikinException("Invalid response from device")
         except asyncio.TimeoutError as e:
-            _LOGGER.error("Timeout communicating with device at %s", self.device_id)
-            raise DaikinException(f"Timeout communicating with device at {self.device_id}") from e
+            _LOGGER.error("Timeout communicating with device at %s", self.device_ip)
+            raise DaikinException(f"Timeout communicating with device at {self.device_ip}") from e
         except DaikinException:
             raise  # Re-raise DaikinException as-is
         except Exception as e:
@@ -327,12 +327,12 @@ class DaikinBRP084(Appliance):
                 error_msg = error_type
             _LOGGER.error(
                 "Error communicating with device at %s: %s (%s)",
-                self.device_id,
+                self.device_ip,
                 error_msg,
                 error_type,
             )
             raise DaikinException(
-                f"Error communicating with device at {self.device_id}: {error_msg} ({error_type})"
+                f"Error communicating with device at {self.device_ip}: {error_msg} ({error_type})"
             ) from e
 
         # Extract basic info
@@ -469,11 +469,11 @@ class DaikinBRP084(Appliance):
             # Network timeout or cancellation - log as warning not error
             _LOGGER.warning(
                 "Network timeout or cancellation communicating with device at %s: %s",
-                self.device_id,
+                self.device_ip,
                 type(e).__name__,
             )
             raise DaikinException(
-                f"Network timeout communicating with device at {self.device_id}"
+                f"Network timeout communicating with device at {self.device_ip}"
             ) from e
         except Exception as e:
             error_msg = str(e).strip()
@@ -482,7 +482,7 @@ class DaikinBRP084(Appliance):
                 error_msg = error_type
             _LOGGER.error(
                 "Error in _get_resource for %s: %s (%s)",
-                self.device_id,
+                self.device_ip,
                 error_msg,
                 error_type,
             )
