@@ -125,7 +125,15 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
                         f"Last error: {airbase_err}"
                     ) from airbase_err
 
-        await self._generated_object.init()
+        try:
+            await self._generated_object.init()
+        except DaikinException as e:
+            # Re-raise with more context about which device type failed
+            device_type = type(self._generated_object).__name__
+            raise DaikinException(
+                f"Failed to initialize {device_type} device at {device_ip}: {e}. "
+                f"The device may be offline or unreachable."
+            ) from e
 
         if not self._generated_object.values.get("mode"):
             raise DaikinException(

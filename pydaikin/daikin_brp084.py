@@ -458,7 +458,7 @@ class DaikinBRP084(Appliance):
                     json=params,
                     headers=self.headers,
                     ssl=self.ssl_context,
-                    timeout=5,  # Add a timeout to avoid hanging
+                    timeout=15,  # Increased from 5s for networks with high latency/congestion
                 ) as response:
                     response.raise_for_status()
                     json_data = await response.json()
