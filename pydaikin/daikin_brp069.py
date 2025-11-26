@@ -224,7 +224,13 @@ class DaikinBRP069(Appliance):
 
     async def set(self, settings):
         """Set settings on Daikin device."""
-        await self._update_settings(settings)
+        device_ip = getattr(self, 'device_ip', None) or getattr(self, '_device_ip', 'unknown')
+        _LOGGER.warning("set() ENTRY [%s]: settings=%s", device_ip, settings)
+        try:
+            await self._update_settings(settings)
+        except Exception as e:
+            _LOGGER.error("set() FAILED [%s]: _update_settings raised %s: %s", device_ip, type(e).__name__, e)
+            raise
 
         path = 'aircon/set_control_info'
         params = {
