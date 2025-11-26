@@ -13,7 +13,15 @@
       "Bash(git rev-parse:*)",
       "Bash(test:*)",
       "Bash(ha network info:*)",
-      "Bash(python -m pytest:*)"
+      "Bash(python -m pytest:*)",
+      "Bash(git tag:*)",
+      "Bash(git describe:*)",
+      "Bash(cat:*)",
+      "Bash(echo:*)",
+      "Bash(git branch:*)",
+      "Bash(python -c:*)",
+      "Bash(ha core check:*)",
+      "Bash(scp:*)"
     ],
     "deny": [],
     "ask": []

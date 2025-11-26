@@ -109,3 +109,65 @@ Both repositories may need PRs to their upstream projects:
 - pydaikin: `C:\Users\Chris\Documents\pydaikin-2.8.0`
 - HA integration: `C:\Users\Chris\Documents\homeassistant-daikin-optimized`
 - Custom daikin_2_8_0: `C:\Users\Chris\Documents\daikin_2_8_0` (deprecated, use optimized version)
+
+## Blueprint Integration
+
+The Daikin integration works in conjunction with the **Ultimate Climate Control Blueprint**:
+
+- **Blueprint Location**: `C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml`
+- **Repository**: https://github.com/Chris971991/Smart-Climate-Control
+
+### Current Feature: Physical Remote Override Detection (v6.2.0)
+
+The integration and blueprint work together to detect when a user turns off the AC using the physical remote while automation is running:
+
+1. **pydaikin** (`daikin_brp069.py`): The `set()` method returns `detected_power_off: True` when device reports `pow=0` but we're trying to set `pow=1`
+2. **climate.py**: Checks this flag and fires `daikin_physical_remote_override` HA event
+3. **Blueprint**: Listens for this event and immediately activates Override mode
+
+### CRITICAL: Deployment Workflow
+
+**ALWAYS edit files in local repos first, then copy to Y: drive for HA to pick up:**
+
+```bash
+# 1. Edit in local repos
+# - pydaikin: C:\Users\Chris\Documents\pydaikin-2.8.0\pydaikin\*.py
+# - climate.py: C:\Users\Chris\Documents\homeassistant-daikin-optimized\custom_components\daikin\climate.py
+# - blueprint: C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml
+
+# 2. Copy to Y: drive (HA's config folder mounted as network share)
+cp "C:\Users\Chris\Documents\homeassistant-daikin-optimized\custom_components\daikin\climate.py" "Y:\custom_components\daikin\climate.py"
+cp "C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml" "Y:\blueprints\automation\Chris971991\ultimate_climate_control.yaml"
+
+# 3. Restart HA to pick up changes
+```
+
+**Y: Drive Structure:**
+- `Y:\custom_components\daikin\` - Daikin integration files
+- `Y:\blueprints\automation\Chris971991\` - Blueprint files
+- `Y:\deps\lib\python3.13\site-packages\pydaikin\` - pydaikin library (installed by HA)
+
+**DO NOT edit files directly on Y: drive** - always edit in local repos and copy over.
+
+### Releasing pydaikin Updates
+
+**IMPORTANT:** You cannot just copy pydaikin files to Y: drive. HA installs pydaikin from GitHub based on the version in manifest.json. To deploy pydaikin changes:
+
+1. **Bump version** in `pyproject.toml` (e.g., 2.24.0 → 2.25.0)
+2. **Commit and push** to GitHub
+3. **Create git tag** matching the version (e.g., `git tag v2.25.0 && git push --tags`)
+4. **Update manifest.json** in both repos to reference new version
+5. **Copy manifest.json and climate.py** to Y: drive
+6. **Restart HA** - it will download the new pydaikin from GitHub
+
+```bash
+# Example release workflow
+cd C:\Users\Chris\Documents\pydaikin-2.8.0
+# Edit pyproject.toml to bump version
+git add . && git commit -m "Release v2.25.0 - Fix physical remote override"
+git push
+git tag v2.25.0 && git push --tags
+
+# Update manifest.json in both repos to use new version
+# Then copy to Y: drive and restart HA
+```

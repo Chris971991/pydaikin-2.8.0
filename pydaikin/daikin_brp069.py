@@ -247,9 +247,16 @@ class DaikinBRP069(Appliance):
         if detected_power_off:
             _LOGGER.warning(
                 "set() DETECTED_POWER_OFF [%s]: Device reported pow=0 but we're setting pow=1. "
-                "Someone may have turned off AC via physical remote.",
+                "Someone may have turned off AC via physical remote. "
+                "ABORTING COMMAND - not sending to device to respect user intent.",
                 device_ip
             )
+            # DON'T send the command - return immediately so climate.py can handle override
+            return {
+                'detected_power_off': True,
+                'current_val': current_val,
+                'command_aborted': True
+            }
 
         path = 'aircon/set_control_info'
         params = {
