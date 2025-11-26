@@ -224,38 +224,44 @@ class DaikinBRP069(Appliance):
 
         return current_val
 
-    async def set(self, settings):
+    async def set(self, settings, expected_pow=None):
         """Set settings on Daikin device.
 
+        Args:
+            settings: dict of settings to apply
+            expected_pow: If provided ('0' or '1'), abort command if device pow doesn't match.
+                         Used by climate.py to detect physical remote override.
+
         Returns:
-            dict with 'detected_power_off' (bool) and 'current_val' (dict)
-            indicating if device was OFF when we're about to turn it ON.
+            dict with 'detected_power_off' (bool), 'current_val' (dict), and optionally 'aborted' (bool)
         """
         device_ip = getattr(self, 'device_ip', None) or getattr(self, '_device_ip', 'unknown')
-        _LOGGER.warning("set() ENTRY [%s]: settings=%s", device_ip, settings)
+        _LOGGER.warning("set() ENTRY [%s]: settings=%s, expected_pow=%s", device_ip, settings, expected_pow)
         try:
             current_val = await self._update_settings(settings)
         except Exception as e:
             _LOGGER.error("set() FAILED [%s]: _update_settings raised %s: %s", device_ip, type(e).__name__, e)
             raise
 
-        # Report if device was OFF when we're trying to turn it ON
-        # This info is passed to climate.py which decides if it's a physical remote override
-        # NOTE: We do NOT abort the command here - that decision is made by climate.py
-        # based on whether it knew the AC was previously ON (via _last_known_pow)
+        # Detect if device was OFF when we're trying to turn it ON
         device_was_off = current_val.get('pow') == '0'
         we_are_turning_on = self.values.get('pow') == '1'
         detected_power_off = device_was_off and we_are_turning_on
 
-        if detected_power_off:
+        # Physical remote override detection:
+        # If caller expected device to be ON (expected_pow='1') but device is OFF,
+        # someone used the physical remote. ABORT the command to prevent fighting.
+        if expected_pow == '1' and device_was_off:
             _LOGGER.warning(
-                "set() DETECTED_POWER_OFF [%s]: Device reported pow=0 but we're setting pow=1. "
-                "Reporting to climate.py - it will decide if this is a physical remote override.",
+                "set() PHYSICAL REMOTE OVERRIDE [%s]: Expected pow=1 but device reports pow=0. "
+                "ABORTING command - user turned off AC via physical remote.",
                 device_ip
             )
-            # NOTE: We continue and send the command anyway. climate.py will check
-            # _last_known_pow to determine if this was a remote override or just
-            # a normal turn-on when AC was already off.
+            return {
+                'detected_power_off': True,
+                'current_val': current_val,
+                'aborted': True  # Signal that command was NOT sent
+            }
 
         path = 'aircon/set_control_info'
         params = {
