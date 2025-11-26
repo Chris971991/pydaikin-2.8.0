@@ -225,14 +225,31 @@ class DaikinBRP069(Appliance):
         return current_val
 
     async def set(self, settings):
-        """Set settings on Daikin device."""
+        """Set settings on Daikin device.
+
+        Returns:
+            dict with 'detected_power_off' (bool) and 'current_val' (dict)
+            indicating if device was OFF when we're about to turn it ON.
+        """
         device_ip = getattr(self, 'device_ip', None) or getattr(self, '_device_ip', 'unknown')
         _LOGGER.warning("set() ENTRY [%s]: settings=%s", device_ip, settings)
         try:
-            await self._update_settings(settings)
+            current_val = await self._update_settings(settings)
         except Exception as e:
             _LOGGER.error("set() FAILED [%s]: _update_settings raised %s: %s", device_ip, type(e).__name__, e)
             raise
+
+        # Detect if device was OFF but we're turning it ON (physical remote intervention)
+        device_was_off = current_val.get('pow') == '0'
+        we_are_turning_on = self.values.get('pow') == '1'
+        detected_power_off = device_was_off and we_are_turning_on
+
+        if detected_power_off:
+            _LOGGER.warning(
+                "set() DETECTED_POWER_OFF [%s]: Device reported pow=0 but we're setting pow=1. "
+                "Someone may have turned off AC via physical remote.",
+                device_ip
+            )
 
         path = 'aircon/set_control_info'
         params = {
@@ -259,6 +276,11 @@ class DaikinBRP069(Appliance):
 
         # Update status after setting to get the latest device state
         await self.update_status()
+
+        return {
+            'detected_power_off': detected_power_off,
+            'current_val': current_val
+        }
 
     async def set_holiday(self, mode):
         """Set holiday mode."""

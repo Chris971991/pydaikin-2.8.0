@@ -132,9 +132,17 @@ class DaikinSkyFi(Appliance):
         return (k, val)
 
     async def set(self, settings):
-        """Set settings on Daikin device."""
+        """Set settings on Daikin device.
+
+        Returns:
+            dict with 'detected_power_off' (bool) and 'current_val' (dict)
+            indicating if device was OFF when we're about to turn it ON.
+        """
         _LOGGER.debug("Updating settings: %s", settings)
         await self.update_status(['ac.cgi'])
+
+        # Capture current power state before we change it
+        device_was_off = self.values.get('opmode') == '0'
 
         # Merge current_val with mapped settings
         self.values.update(
@@ -161,7 +169,22 @@ class DaikinSkyFi(Appliance):
                 "m": self.values['acmode'],
             }
 
+        # Detect if device was OFF but we're turning it ON (physical remote intervention)
+        we_are_turning_on = self.values.get('opmode') == '1'
+        detected_power_off = device_was_off and we_are_turning_on
+
+        if detected_power_off:
+            _LOGGER.warning(
+                "set() DETECTED_POWER_OFF [SkyFi]: Device reported opmode=0 but we're setting opmode=1. "
+                "Someone may have turned off AC via physical remote."
+            )
+
         self.values.update(await self._get_resource("set.cgi", params))
+
+        return {
+            'detected_power_off': detected_power_off,
+            'current_val': self.values.copy()
+        }
 
     @property
     def zones(self):

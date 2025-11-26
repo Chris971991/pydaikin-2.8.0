@@ -697,7 +697,12 @@ class DaikinBRP084(Appliance):
         )
 
     async def set(self, settings):
-        """Set settings on Daikin device."""
+        """Set settings on Daikin device.
+
+        Returns:
+            dict with 'detected_power_off' (bool) - always False for BRP084
+            since it doesn't fetch current state before setting.
+        """
         await self._update_settings(settings)
 
         # Handle temperature setting with smart clipping if other settings exist
@@ -717,7 +722,7 @@ class DaikinBRP084(Appliance):
                 _LOGGER.info(self._last_temp_adjustment['message'])
             else:
                 self._last_temp_adjustment = None
-            return  # Exit early for temperature-only settings
+            return {'detected_power_off': False, 'current_val': None}
 
         # Handle other settings normally
         requests = []
@@ -753,6 +758,8 @@ class DaikinBRP084(Appliance):
                         f"Expected: {'off' if expected_pow == '0' else 'on'}, "
                         f"Actual: {'off' if actual_pow == '0' else 'on'}"
                     )
+
+        return {'detected_power_off': False, 'current_val': None}
 
     # pylint: disable=unused-argument
     async def set_streamer(self, mode):

@@ -146,8 +146,24 @@ class DaikinAirBase(DaikinBRP069):
         return current_val
 
     async def set(self, settings):
-        """Set settings on Daikin device."""
-        await self._update_settings(settings)
+        """Set settings on Daikin device.
+
+        Returns:
+            dict with 'detected_power_off' (bool) and 'current_val' (dict)
+            indicating if device was OFF when we're about to turn it ON.
+        """
+        current_val = await self._update_settings(settings)
+
+        # Detect if device was OFF but we're turning it ON (physical remote intervention)
+        device_was_off = current_val.get('pow') == '0'
+        we_are_turning_on = self.values.get('pow') == '1'
+        detected_power_off = device_was_off and we_are_turning_on
+
+        if detected_power_off:
+            _LOGGER.warning(
+                "set() DETECTED_POWER_OFF [AirBase]: Device reported pow=0 but we're setting pow=1. "
+                "Someone may have turned off AC via physical remote."
+            )
 
         self.values.setdefault("f_airside", 0)
 
@@ -166,6 +182,11 @@ class DaikinAirBase(DaikinBRP069):
 
         _LOGGER.debug("Sending request to %s with params: %s", path, params)
         await self._get_resource(path, params)
+
+        return {
+            'detected_power_off': detected_power_off,
+            'current_val': current_val
+        }
 
     def represent(self, key):
         """Return translated value from key."""
