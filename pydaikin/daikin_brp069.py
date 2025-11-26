@@ -184,6 +184,20 @@ class DaikinBRP069(Appliance):
         elif 'mode' in settings or not settings:
             self.values['pow'] = '1'
 
+        # FIX: If changing temperature, fan, or swing while device is off and mode is
+        # not being changed to 'off', we need to power on the device.
+        # This handles cases where HA sends only temp/fan changes without explicit mode.
+        elif settings and current_val.get('pow') == '0':
+            # Only power on if the current mode is a valid operational mode (not off)
+            # and we're sending operational settings (temp, fan, swing)
+            operational_settings = {'stemp', 'f_rate', 'f_dir', 'shum'}
+            if any(k in settings for k in operational_settings):
+                self.values['pow'] = '1'
+                _LOGGER.debug(
+                    "Auto-powering on device: settings=%s contained operational params",
+                    list(settings.keys())
+                )
+
         # Use settings for respecitve mode (dh and dt)
         for k, val in {'stemp': 'dt', 'shum': 'dh', 'f_rate': 'dfr'}.items():
             if k not in settings:
