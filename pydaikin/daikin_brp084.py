@@ -458,19 +458,24 @@ class DaikinBRP084(Appliance):
                     json=params,
                     headers=self.headers,
                     ssl=self.ssl_context,
-                    timeout=15,  # Increased from 5s for networks with high latency/congestion
+                    timeout=20,  # Match base class timeout for slow/congested networks
                 ) as response:
                     response.raise_for_status()
                     json_data = await response.json()
                     if json_data is None:
                         raise DaikinException("Device returned null/empty JSON response")
                     return json_data
-        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
-            # Network timeout or cancellation - log as warning not error
-            _LOGGER.warning(
-                "Network timeout or cancellation communicating with device at %s: %s",
+        except asyncio.CancelledError:
+            # Task was cancelled (e.g., by blueprint restart) - don't log as error
+            _LOGGER.debug(
+                "Request cancelled for device at %s (likely automation restart)",
                 self.device_ip,
-                type(e).__name__,
+            )
+            raise  # Re-raise to propagate cancellation
+        except asyncio.TimeoutError as e:
+            _LOGGER.warning(
+                "Network timeout communicating with device at %s",
+                self.device_ip,
             )
             raise DaikinException(
                 f"Network timeout communicating with device at {self.device_ip}"
