@@ -163,14 +163,16 @@ class DaikinBRP069(Appliance):
 
     async def _update_settings(self, settings):
         """Update settings to set on Daikin device."""
+        device_ip = getattr(self, 'device_ip', None) or getattr(self, '_device_ip', 'unknown')
+        _LOGGER.warning("_update_settings START [%s]: settings=%s", device_ip, settings)
+
         # start with current values
         resource = 'aircon/get_control_info'
+        _LOGGER.warning("_update_settings [%s]: Fetching current state...", device_ip)
         current_val = await self._get_resource(resource)
-
-        device_ip = getattr(self, 'device_ip', None) or getattr(self, '_device_ip', 'unknown')
         _LOGGER.warning(
-            "_update_settings ENTRY [%s]: settings=%s, current_val.pow=%s",
-            device_ip, settings, current_val.get('pow')
+            "_update_settings FETCHED [%s]: current_val.pow=%s",
+            device_ip, current_val.get('pow')
         )
 
         # Merge current_val with mapped settings
