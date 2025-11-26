@@ -485,8 +485,14 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
         """Return list of supported swing modes."""
         return list(map(str.title, self.TRANSLATIONS.get('f_dir', {}).values()))
 
-    async def set(self, settings):
-        """Set settings on Daikin device."""
+    async def set(self, settings, expected_pow=None):
+        """Set settings on Daikin device.
+
+        Args:
+            settings: dict of settings to apply
+            expected_pow: If provided ('0' or '1'), abort command if device pow doesn't match.
+                         Used by climate.py to detect physical remote override.
+        """
         raise NotImplementedError
 
     async def set_holiday(self, mode):

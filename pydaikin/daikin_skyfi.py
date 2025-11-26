@@ -131,8 +131,13 @@ class DaikinSkyFi(Appliance):
             val = str(bin(int(self[key]) + 256))[3 : int(self['nz']) + 3]
         return (k, val)
 
-    async def set(self, settings):
+    async def set(self, settings, expected_pow=None):
         """Set settings on Daikin device.
+
+        Args:
+            settings: dict of settings to apply
+            expected_pow: If provided ('0' or '1'), used for physical remote override detection.
+                         Currently not used for abort logic in SkyFi, but included for API compatibility.
 
         Returns:
             dict with 'detected_power_off' (bool) and 'current_val' (dict)

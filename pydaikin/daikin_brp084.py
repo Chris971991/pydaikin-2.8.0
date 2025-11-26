@@ -696,13 +696,23 @@ class DaikinBRP084(Appliance):
             ),
         )
 
-    async def set(self, settings):
+    async def set(self, settings, expected_pow=None):
         """Set settings on Daikin device.
+
+        Args:
+            settings: dict of settings to apply
+            expected_pow: Ignored for BRP084 - included for API compatibility with BRP069.
+                         BRP084 doesn't fetch current state before setting, so it can't
+                         detect physical remote override at command time.
 
         Returns:
             dict with 'detected_power_off' (bool) - always False for BRP084
             since it doesn't fetch current state before setting.
         """
+        # Note: expected_pow is ignored for BRP084 because this device type
+        # doesn't fetch current state before sending commands, so we can't
+        # detect if the physical remote turned off the AC. Physical remote
+        # override detection will rely on poll-based detection instead.
         await self._update_settings(settings)
 
         # Handle temperature setting with smart clipping if other settings exist
