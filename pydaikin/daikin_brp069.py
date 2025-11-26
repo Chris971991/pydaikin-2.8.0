@@ -239,7 +239,10 @@ class DaikinBRP069(Appliance):
             _LOGGER.error("set() FAILED [%s]: _update_settings raised %s: %s", device_ip, type(e).__name__, e)
             raise
 
-        # Detect if device was OFF but we're turning it ON (physical remote intervention)
+        # Report if device was OFF when we're trying to turn it ON
+        # This info is passed to climate.py which decides if it's a physical remote override
+        # NOTE: We do NOT abort the command here - that decision is made by climate.py
+        # based on whether it knew the AC was previously ON (via _last_known_pow)
         device_was_off = current_val.get('pow') == '0'
         we_are_turning_on = self.values.get('pow') == '1'
         detected_power_off = device_was_off and we_are_turning_on
@@ -247,16 +250,12 @@ class DaikinBRP069(Appliance):
         if detected_power_off:
             _LOGGER.warning(
                 "set() DETECTED_POWER_OFF [%s]: Device reported pow=0 but we're setting pow=1. "
-                "Someone may have turned off AC via physical remote. "
-                "ABORTING COMMAND - not sending to device to respect user intent.",
+                "Reporting to climate.py - it will decide if this is a physical remote override.",
                 device_ip
             )
-            # DON'T send the command - return immediately so climate.py can handle override
-            return {
-                'detected_power_off': True,
-                'current_val': current_val,
-                'command_aborted': True
-            }
+            # NOTE: We continue and send the command anyway. climate.py will check
+            # _last_known_pow to determine if this was a remote override or just
+            # a normal turn-on when AC was already off.
 
         path = 'aircon/set_control_info'
         params = {
