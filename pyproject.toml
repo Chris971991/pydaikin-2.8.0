@@ -7,7 +7,7 @@ authors = [
   { name = "Fredrik Erlandsson", email = "fredrik.e@gmail.com" },
   { name = "Yari Adan", email = "mustang@yadan.org" },
 ]
-name = "pydaikin"
+name = "pydaikin-custom"
 version = "2.23.2"
 description = "Python Daikin HVAC appliances interface"
 classifiers = [
