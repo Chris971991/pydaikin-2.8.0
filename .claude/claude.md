@@ -1,5 +1,170 @@
 # pydaikin Development Notes
 
+## CRITICAL: Use `cp` for File Copy Operations (HIGH PRIORITY!)
+
+**ALWAYS use `cp` command for copying files, NOT `copy` or `cmd /c copy`.**
+
+```bash
+# CORRECT - Use this:
+cp "source/path/file.py" "Y:/destination/path/file.py"
+
+# WRONG - Never use these:
+copy "source" "dest"           # Windows copy doesn't work reliably
+cmd /c copy "source" "dest"    # Same issue
+```
+
+This applies to ALL file copy operations, especially when deploying to Y: drive.
+
+---
+
+## Physical Remote Override Detection System (v2.33.0)
+
+### Purpose
+When automation is controlling the AC and a user presses the **physical IR remote** to turn it OFF (or ON), the system detects this and activates **Override Mode** - pausing all automation for that room.
+
+### How It Works (The Core Logic)
+
+**Key Principle:** `_last_known_pow` must ONLY reflect what the device has CONFIRMED, not what we asked it to do.
+
+1. **Automation sends ON command:**
+   - `_last_on_command_time` is set (for 30s protection window)
+   - `_last_known_pow` is **NOT changed** (stays at previous confirmed value)
+
+2. **Device confirms ON:**
+   - Coordinator polls device, sees `pow=1`
+   - `_last_known_pow` is updated to `'1'`
+
+3. **User presses OFF on physical remote:**
+   - Device turns off
+   - Coordinator polls, sees `pow=0`
+
+4. **Override Detection fires:**
+   - Sees: `_last_known_pow='1'` (confirmed ON) but `current_pow='0'` (now OFF)
+   - Check: Did we send ON recently? Yes, but device already confirmed ON
+   - **Result: Override fires!** → `daikin_physical_remote_override` event
+
+### Critical Variables in `climate.py`
+
+| Variable | Purpose | Updated By |
+|----------|---------|------------|
+| `_last_known_pow` | Last CONFIRMED device power state | Coordinator ONLY |
+| `_last_on_command_time` | When we sent an ON command | `_set()` method |
+| `_last_off_command_time` | When we sent an OFF command | `_set()` method |
+| `_last_override_event_time` | Debounce duplicate events | Override detection |
+
+### Protection Windows (Prevent False Positives)
+
+The 30-second protection window prevents false overrides when:
+- We send ON but device is slow to turn on
+- We send OFF but device is slow to turn off
+
+**Key insight:** Only skip detection if device hasn't confirmed our command yet.
+
+```python
+# Example: We sent ON, device is slow
+if _last_on_command_time < 30s ago:
+    if _last_known_pow == '0':  # Device hasn't confirmed ON yet
+        skip detection  # Might be slow device, not remote
+    else:  # _last_known_pow == '1', device confirmed ON
+        fire override!  # This is a REAL remote press
+```
+
+### What NOT To Do
+
+1. **DO NOT set `_last_known_pow` in `_set()`** - This caused remote detection to never fire because it thought device already confirmed
+2. **DO NOT remove the 30s protection window** - Causes false overrides on slow devices
+3. **DO NOT check `expected_pow` in pydaikin** - Too many race conditions, use coordinator polling only
+
+### Blueprint Integration
+
+The blueprint listens for `daikin_physical_remote_override` event and:
+1. Sets `control_mode` to `Override`
+2. Records timestamp in `input_datetime.climate_override_time_<room>`
+3. Pauses all automation for configured timeout (default 2 hours)
+
+### Testing Remote Override
+
+1. Put room in Smart mode with presence
+2. Wait for automation to turn AC ON
+3. Wait ~15 seconds for device to confirm ON (check logs)
+4. Press OFF on physical remote
+5. Override should fire within 10 seconds (next coordinator poll)
+
+---
+
+## SSH Access to Home Assistant (CRITICAL - USE THIS!)
+
+**SSH is configured and working. Use this for all HA operations:**
+
+```bash
+# The magic incantation to run ha commands via SSH:
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; <COMMAND>'
+```
+
+**Why the weird `for f in ...` stuff?**
+The SSH add-on doesn't automatically load the `SUPERVISOR_TOKEN` environment variable. The loop sources it from `/run/s6/container_environment/` so `ha` commands work.
+
+### Common SSH Commands
+
+```bash
+# Reload automations (for blueprint changes - NO restart needed!)
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" http://supervisor/core/api/services/automation/reload'
+
+# Restart Home Assistant (only needed for integration/pydaikin changes)
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core restart'
+
+# View logs (live follow)
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core logs --follow'
+
+# View recent logs
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core logs 2>&1 | tail -200'
+
+# Get entity state via API
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" http://supervisor/core/api/states/climate.master_bedroom_a_c'
+
+# Get entity history
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" "http://supervisor/core/api/history/period/2025-11-28T00:30:00+00:00?filter_entity_id=climate.master_bedroom_a_c"'
+
+# Check HA config
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core check'
+```
+
+### SSH Add-on Configuration
+
+- **Username:** hassio
+- **Password:** hassio
+- **Port:** 22
+- **SSH Key:** Already configured in add-on (ed25519 key from this machine)
+
+### Troubleshooting SSH
+
+If you get `401: Unauthorized`:
+- The `SUPERVISOR_TOKEN` isn't being loaded
+- Make sure to use the `for f in /run/s6/container_environment/*` wrapper
+
+If connection fails:
+- Try `homeassistant.local` or the IP `192.168.50.45`
+- Check SSH add-on is running in HA
+
+### Override Log Viewing
+
+When manual override is triggered, the blueprint writes detailed logs with `[OVERRIDE_LOG]` prefix:
+
+```bash
+# View all override logs
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core logs 2>&1 | grep "OVERRIDE_LOG"'
+```
+
+The log includes:
+- **TRIGGER**: trigger ID, from/to states
+- **CONTEXT**: user_id, parent_id (identifies automation vs manual)
+- **INTEGRATION**: device type, expected HVAC/temp/fan, last command time, entity init time
+- **ACTUAL**: current HVAC mode, temperature, fan, swing
+- **LOGIC**: manual_override flag, control_mode, actual_ac_state, time since change
+- **CHECKSUM**: actual vs stored checksums, state machine
+
+---
+
 ## Project Structure
 
 This repository is part of a two-repository system for the Daikin Home Assistant integration:
@@ -149,6 +314,20 @@ cp "C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_clima
 
 **DO NOT edit files directly on Y: drive** - always edit in local repos and copy over.
 
+### When to Reload vs Restart
+
+| Change Type | Action Required |
+|-------------|-----------------|
+| Blueprint YAML changes | **Reload automations** (fast, ~2 seconds) |
+| Package YAML changes (helpers) | **Restart HA** (helpers need full reload) |
+| Integration (climate.py, etc.) | **Restart HA** |
+| pydaikin library | **Reinstall pydaikin + Restart HA** |
+
+**Reload automations command:**
+```bash
+ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" http://supervisor/core/api/services/automation/reload'
+```
+
 ### Releasing pydaikin Updates
 
 **IMPORTANT:** You cannot just copy pydaikin files to Y: drive. HA installs pydaikin from GitHub based on the version in manifest.json. To deploy pydaikin changes:
@@ -156,9 +335,10 @@ cp "C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_clima
 1. **Bump version** in `pyproject.toml` (e.g., 2.24.0 → 2.25.0)
 2. **Commit and push** to GitHub
 3. **Create git tag** matching the version (e.g., `git tag v2.25.0 && git push --tags`)
-4. **Update manifest.json** in both repos to reference new version
+4. **Update manifest.json** in both repos to reference new commit hash and version
 5. **Copy manifest.json and climate.py** to Y: drive
-6. **Restart HA** - it will download the new pydaikin from GitHub
+6. **SSH into HA and reinstall pydaikin** (see commands below)
+7. **Restart HA** to pick up the new pydaikin
 
 ```bash
 # Example release workflow
@@ -168,6 +348,78 @@ git add . && git commit -m "Release v2.25.0 - Fix physical remote override"
 git push
 git tag v2.25.0 && git push --tags
 
-# Update manifest.json in both repos to use new version
-# Then copy to Y: drive and restart HA
+# Get the new commit hash for manifest.json
+git rev-parse HEAD
+
+# Update manifest.json in both repos to use new commit hash
+# Then copy to Y: drive
 ```
+
+### SSH Commands to Reinstall pydaikin
+
+**After pushing pydaikin changes to GitHub, run these commands via SSH/Terminal on Home Assistant:**
+
+```bash
+# Stop Home Assistant
+ha core stop
+
+# Uninstall old version and install new version
+pip uninstall pydaikin -y
+pip install git+https://github.com/Chris971991/pydaikin-2.8.0.git@<COMMIT_HASH>
+
+# Start Home Assistant
+ha core start
+```
+
+**Or as a single command chain:**
+```bash
+ha core stop && pip uninstall pydaikin -y && pip install git+https://github.com/Chris971991/pydaikin-2.8.0.git@<COMMIT_HASH> && ha core start
+```
+
+**Replace `<COMMIT_HASH>` with the actual commit hash from `git rev-parse HEAD`**
+
+**Note:** If using Home Assistant OS container:
+```bash
+docker exec -it homeassistant pip uninstall pydaikin -y
+docker exec -it homeassistant pip install git+https://github.com/Chris971991/pydaikin-2.8.0.git@<COMMIT_HASH>
+```
+
+## Performance Tuning Options
+
+If BRP084 devices experience network timeouts or instability, these optional fixes can help:
+
+### Option 1: Skip Post-Set Refresh (Reduces HTTP traffic ~50%)
+**File:** `pydaikin/daikin_brp084.py`
+
+Add `skip_refresh` parameter to `set()` method:
+```python
+async def set(self, settings, expected_pow=None, skip_refresh=False):
+    # ... existing code ...
+    if requests:
+        # ... send request ...
+
+        # Skip refresh if caller will handle it (coordinator polls within 10s anyway)
+        if not skip_refresh:
+            await self.update_status()
+```
+
+Then in `climate.py`, call with `skip_refresh=True` to rely on coordinator polling instead.
+
+### Option 2: Increase Polling Interval (10s → 15s)
+**File:** `custom_components/daikin/const.py`
+
+```python
+# Change from:
+DEFAULT_UPDATE_INTERVAL = 10
+
+# To:
+DEFAULT_UPDATE_INTERVAL = 15  # Reduces request pile-ups on slow devices
+```
+
+**Trade-off:** Physical remote detection takes 15s instead of 10s.
+
+### Current Settings (v2.28.0)
+- BRP084 HTTP timeout: 20s (increased from 15s)
+- BRP069 HTTP timeout: 20s (base class default)
+- Polling interval: 10s
+- MAX_CONCURRENT_REQUESTS: 4

@@ -158,33 +158,62 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
 
         # cannot manage session on outer async with or this will close the session
         # passed to pydaikin (homeassistant for instance)
-        async with self.request_semaphore:
-            # Set a generous timeout for slow/old devices (20 seconds total)
-            # Some older Daikin units can take 15+ seconds to respond
-            timeout = ClientTimeout(total=20)
-            async with self.session.get(
-                f'{self.base_url}/{path}',
-                params=params,
-                headers=self.headers,
-                ssl=self.ssl_context,
-                timeout=timeout,
-            ) as response:
-                if response.status == 403:
-                    raise HTTPForbidden(reason=f"HTTP 403 Forbidden for {response.url}")
-                # Airbase returns a 404 response on invalid urls but requires fallback
-                if response.status == 404:
-                    _LOGGER.debug("HTTP 404 Not Found for %s", response.url)
-                    return (
-                        {}
-                    )  # return an empty dict to indicate successful connection but bad data
-                if response.status != 200:
+        try:
+            async with self.request_semaphore:
+                # Set a generous timeout for slow/old devices (20 seconds total)
+                # Some older Daikin units can take 15+ seconds to respond
+                timeout = ClientTimeout(total=20)
+                _LOGGER.debug("HTTP REQUEST START: %s/%s", self.base_url, path)
+                async with self.session.get(
+                    f'{self.base_url}/{path}',
+                    params=params,
+                    headers=self.headers,
+                    ssl=self.ssl_context,
+                    timeout=timeout,
+                ) as response:
                     _LOGGER.debug(
-                        "Unexpected HTTP status code %s for %s",
-                        response.status,
-                        response.url,
+                        "HTTP RESPONSE: %s/%s status=%s",
+                        self.base_url, path, response.status
                     )
-                response.raise_for_status()
-                return self.parse_response(await response.text())
+                    if response.status == 403:
+                        raise HTTPForbidden(reason=f"HTTP 403 Forbidden for {response.url}")
+                    # Airbase returns a 404 response on invalid urls but requires fallback
+                    if response.status == 404:
+                        _LOGGER.debug("HTTP 404 Not Found for %s", response.url)
+                        return (
+                            {}
+                        )  # return an empty dict to indicate successful connection but bad data
+                    if response.status != 200:
+                        _LOGGER.debug(
+                            "Unexpected HTTP status code %s for %s",
+                            response.status,
+                            response.url,
+                        )
+                    response.raise_for_status()
+                    result = self.parse_response(await response.text())
+                    _LOGGER.debug(
+                        "HTTP REQUEST COMPLETE: %s/%s",
+                        self.base_url, path
+                    )
+                    return result
+        except asyncio.CancelledError:
+            _LOGGER.warning(
+                "HTTP REQUEST CANCELLED: %s/%s - Task was cancelled externally",
+                self.base_url, path
+            )
+            raise
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "HTTP REQUEST TIMEOUT: %s/%s - Request timed out after 20s",
+                self.base_url, path
+            )
+            raise
+        except Exception as e:
+            _LOGGER.warning(
+                "HTTP REQUEST ERROR: %s/%s - %s: %s",
+                self.base_url, path, type(e).__name__, e
+            )
+            raise
 
     async def update_status(self, resources=None):
         """Update status from resources."""
