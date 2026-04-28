@@ -758,20 +758,22 @@ class DaikinBRP084(Appliance):
             # Update status after setting
             await self.update_status()
 
-            # Verify power state actually changed for on/off commands
+            # v2.31.0: Power state verification - WARNING ONLY, do not raise.
+            # Per project guidance (CLAUDE.md): "DO NOT check expected_pow in pydaikin -
+            # Too many race conditions, use coordinator polling only".
+            # BRP072C/BRP084 devices may not reflect the new pow value in the post-set
+            # update_status() poll due to slow firmware processing. Raising here would
+            # propagate to climate.py:381, clear optimistic state, and cause cascading
+            # false-override events. Physical remote override detection happens via
+            # _handle_coordinator_update() which polls every 10s and reconciles.
             if 'mode' in settings:
                 expected_pow = '0' if settings['mode'] == 'off' else '1'
                 actual_pow = self.values.get('pow')
                 if actual_pow != expected_pow:
-                    _LOGGER.error(
-                        "Power state verification failed! Expected pow=%s, got pow=%s. "
-                        "Device may have ignored the command.",
+                    _LOGGER.warning(
+                        "Power state not yet reflected after set(): expected pow=%s, got pow=%s. "
+                        "Device may be slow to apply; coordinator poll will reconcile.",
                         expected_pow, actual_pow
-                    )
-                    raise DaikinException(
-                        f"Device did not change power state. "
-                        f"Expected: {'off' if expected_pow == '0' else 'on'}, "
-                        f"Actual: {'off' if actual_pow == '0' else 'on'}"
                     )
 
         return {'detected_power_off': False, 'current_val': None}

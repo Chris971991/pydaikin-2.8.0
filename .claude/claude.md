@@ -90,72 +90,120 @@ The blueprint listens for `daikin_physical_remote_override` event and:
 4. Press OFF on physical remote
 5. Override should fire within 10 seconds (next coordinator poll)
 
+### v2.37.0 Mode-Transition Grace Tradeoff
+
+The 45s grace at `climate.py:605` (`_last_any_command_time`) suppresses ALL override
+detection for 45 seconds after ANY automation command.
+
+**Intentional:** Daikin units bounce `pow 1→0→1` during mode transitions
+(e.g., `cool→fan_only`). Without this grace, every transition would fire a false override.
+
+**Side effect:** Real remote presses within 45s of any automation command are NOT
+detected as overrides immediately. They will be picked up via:
+1. Periodic_check in blueprint (60s cadence) — see `manual_override_detection` template
+2. Next state mismatch when automation queries expected vs actual
+
+**Setups with high trigger volume:** Continuously refreshing automations (10K+
+triggers/day) keep this grace continuously active. By design — periodic_check
+is the safety net.
+
+**If you need to tune:** constant is at `climate.py` line 605 (`< 45`). Decreasing
+risks false overrides during mode transitions; increasing further may starve
+real-remote detection.
+
+### v2.31.0 Post-Set Verification Removed (BRP084)
+
+The BRP084 post-set power verification raise (was at `daikin_brp084.py:771`) was
+removed in pydaikin v2.31.0 per the same principle: rely on coordinator polling
+for state reconciliation, not in-call verification. Slow devices (BRP072C with
+30s integration timeout) were causing cascading false-override chains via the
+`raise → service-error → optimistic-state-cleared → next-poll-detects-mismatch`
+sequence.
+
+**Post-fix behavior:** If a device truly ignores a set command, the warning logs
+"Power state not yet reflected after set()" and the coordinator's next poll
+(within 10s) reconciles state. Optimistic state expires after 30s, so HA UI
+self-heals without raising service errors.
+
+### v2.36.0 Coordinator Reconnect Grace (climate.py)
+
+`_entity_init_timestamp` was previously set ONLY in `__init__` and never reset.
+After power outage / device reboot / network outage, the entity persists in HA
+memory but the device may report fresh `pow=0` while `_last_known_pow='1'`,
+firing a false override.
+
+**v2.36.0 fix:** Track `_last_coordinator_success` and `_last_coordinator_recovery_time`.
+On coordinator transition `failed → success`, if `_last_known_pow != current_pow`,
+apply a 60s reconnect grace (same as startup grace) to silently sync state.
+
+**Critical:** The grace only applies when pow ACTUALLY CHANGED across the outage —
+benign network blips where state didn't change shouldn't suppress real-remote
+detection that happens AFTER recovery.
+
+**Tradeoff:** A real remote press DURING the outage window is silently synced
+(missed). Acceptable: false-positive overrides cost hours of broken automation;
+missed presses cost one cycle until next mismatch detected.
+
 ---
 
-## SSH Access to Home Assistant (CRITICAL - USE THIS!)
+## Home Assistant Access — MCP First, SSH as Fallback
 
-**SSH is configured and working. Use this for all HA operations:**
+**The Home Assistant MCP is installed globally (`uvx ha-mcp@latest`). Always prefer MCP tools — they are faster, structured, and don't need the SSH/SUPERVISOR_TOKEN dance.**
+
+### MCP Tool Reference (use these by default)
+
+| Task | MCP Tool | Notes |
+|------|----------|-------|
+| Reload automations | `ha_call_service("automation", "reload")` | After blueprint YAML edits |
+| Restart HA | `ha_restart(confirm=True)` | Run `ha_check_config()` first |
+| Validate config | `ha_check_config()` | |
+| Recent error logs | `ha_get_logs(source="error_log", limit=200)` | |
+| Logs filtered (e.g. OVERRIDE_LOG) | `ha_get_logs(source="error_log", search="OVERRIDE_LOG")` | |
+| System log entries | `ha_get_logs(source="system", level="ERROR")` | Structured errors/warnings |
+| Logbook (state changes) | `ha_get_logs(source="logbook", entity_id="...")` | |
+| Entity state | `ha_get_state("climate.master_bedroom_a_c")` | Single or list of IDs |
+| Entity history | `ha_get_history(entity_ids="...", start_time="24h")` | Relative times supported |
+| Find entities | `ha_search_entities(...)` / `ha_deep_search(...)` | |
+| Call any service | `ha_call_service(domain, service, entity_id, data)` | |
+
+### MCP-Only Capabilities (no SSH equivalent — big upgrade for AC debugging)
+
+| Task | MCP Tool | Why it matters |
+|------|----------|----------------|
+| **Automation traces** | `ha_get_automation_traces("automation.<id>")` then with `run_id=...` | Step-by-step view of which trigger fired, conditions passed/failed, actions ran. **Primary tool** for debugging override-detection misfires in the blueprint. |
+| **Live Jinja eval** | `ha_eval_template("{{ ... }}")` | Test the blueprint's checksum/state-machine templates against live state without YAML round-trips. |
+| **Get/set automation YAML** | `ha_config_get_automation` / `ha_config_set_automation` | Read or apply automation config without file edit + reload dance. |
+
+### When MCP cannot help — SSH still required
+
+Two workflows the MCP **cannot** do; use SSH for these:
+
+1. **Live log tailing (`--follow`)** — MCP gets snapshots only. For real-time monitoring during a test:
+   ```bash
+   ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core logs --follow'
+   ```
+2. **Reinstall pydaikin via pip** — package management is not exposed via MCP. See "SSH Commands to Reinstall pydaikin" further down.
+
+### SSH Reference (fallback only)
+
+Wrap any HA CLI / Supervisor API command in this incantation (the loop sources `SUPERVISOR_TOKEN` from `/run/s6/container_environment/`):
 
 ```bash
-# The magic incantation to run ha commands via SSH:
 ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; <COMMAND>'
 ```
 
-**Why the weird `for f in ...` stuff?**
-The SSH add-on doesn't automatically load the `SUPERVISOR_TOKEN` environment variable. The loop sources it from `/run/s6/container_environment/` so `ha` commands work.
+- **SSH credentials:** user `hassio`, password `hassio`, port 22 (ed25519 key already configured)
+- **If 401 Unauthorized:** the `SUPERVISOR_TOKEN` wrapper isn't loaded — re-add the `for f in ...` prefix
+- **If connection fails:** try IP `192.168.50.45` instead of `homeassistant.local`; check SSH add-on is running
 
-### Common SSH Commands
+### Override Log Format Reference
 
-```bash
-# Reload automations (for blueprint changes - NO restart needed!)
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" http://supervisor/core/api/services/automation/reload'
-
-# Restart Home Assistant (only needed for integration/pydaikin changes)
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core restart'
-
-# View logs (live follow)
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core logs --follow'
-
-# View recent logs
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core logs 2>&1 | tail -200'
-
-# Get entity state via API
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" http://supervisor/core/api/states/climate.master_bedroom_a_c'
-
-# Get entity history
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" "http://supervisor/core/api/history/period/2025-11-28T00:30:00+00:00?filter_entity_id=climate.master_bedroom_a_c"'
-
-# Check HA config
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core check'
+Blueprint writes `[OVERRIDE_LOG]` lines when override fires. Filter via:
+```python
+ha_get_logs(source="error_log", search="OVERRIDE_LOG")
 ```
 
-### SSH Add-on Configuration
-
-- **Username:** hassio
-- **Password:** hassio
-- **Port:** 22
-- **SSH Key:** Already configured in add-on (ed25519 key from this machine)
-
-### Troubleshooting SSH
-
-If you get `401: Unauthorized`:
-- The `SUPERVISOR_TOKEN` isn't being loaded
-- Make sure to use the `for f in /run/s6/container_environment/*` wrapper
-
-If connection fails:
-- Try `homeassistant.local` or the IP `192.168.50.45`
-- Check SSH add-on is running in HA
-
-### Override Log Viewing
-
-When manual override is triggered, the blueprint writes detailed logs with `[OVERRIDE_LOG]` prefix:
-
-```bash
-# View all override logs
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; ha core logs 2>&1 | grep "OVERRIDE_LOG"'
-```
-
-The log includes:
+Each entry includes:
 - **TRIGGER**: trigger ID, from/to states
 - **CONTEXT**: user_id, parent_id (identifies automation vs manual)
 - **INTEGRATION**: device type, expected HVAC/temp/fan, last command time, entity init time
@@ -323,10 +371,12 @@ cp "C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_clima
 | Integration (climate.py, etc.) | **Restart HA** |
 | pydaikin library | **Reinstall pydaikin + Restart HA** |
 
-**Reload automations command:**
-```bash
-ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" http://supervisor/core/api/services/automation/reload'
-```
+**Reload automations:**
+- **Preferred (MCP):** `ha_call_service("automation", "reload")`
+- **Fallback (SSH):**
+  ```bash
+  ssh -o StrictHostKeyChecking=no hassio@homeassistant.local 'for f in /run/s6/container_environment/*; do export "$(basename $f)"="$(cat $f)"; done; curl -s -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" http://supervisor/core/api/services/automation/reload'
+  ```
 
 ### Releasing pydaikin Updates
 
