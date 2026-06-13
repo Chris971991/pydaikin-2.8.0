@@ -111,13 +111,15 @@ class DaikinSkyFi(Appliance):
         )
         return response
 
-    async def _get_resource(self, path: str, params: dict | None = None):
+    async def _get_resource(
+        self, path: str, params: dict | None = None, *, attempts: int = 2
+    ):
         """Make the http request."""
         if params is None:
             params = {}
         # ensure password is the first parameter
         params = {**{"pass": self._password}, **params}
-        ret = await super()._get_resource(path, params)
+        ret = await super()._get_resource(path, params, attempts=attempts)
         await sleep(0.3)
         return ret
 

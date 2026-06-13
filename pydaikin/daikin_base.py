@@ -4,6 +4,7 @@ import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import logging
+import random
 import socket
 from ssl import SSLContext
 from typing import Optional
@@ -17,13 +18,6 @@ from aiohttp.client_exceptions import (
     ServerTimeoutError,
 )
 from aiohttp.web_exceptions import HTTPForbidden
-from tenacity import (
-    before_sleep_log,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_random_exponential,
-)
 
 from .discovery import get_name
 from .power import ATTR_COOL, ATTR_HEAT, ATTR_TOTAL, TIME_TODAY, DaikinPowerMixin
@@ -31,6 +25,26 @@ from .response import parse_response
 from .values import ApplianceValues
 
 _LOGGER = logging.getLogger(__name__)
+
+# Transient network errors worth retrying in-call. HTTPForbidden (auth) and
+# CancelledError are deliberately excluded: fail fast / propagate.
+RETRYABLE_EXCEPTIONS = (
+    ClientOSError,
+    ClientResponseError,
+    ServerDisconnectedError,
+    ServerTimeoutError,
+    asyncio.TimeoutError,
+)
+
+
+def _redact(params: dict, headers: dict) -> tuple:
+    """Return copies of params/headers with credentials masked for logging."""
+    redacted_params = {**params, **{k: '****' for k in ('pass', 'key') if k in params}}
+    redacted_headers = {
+        **headers,
+        **({'X-Daikin-uuid': '****'} if 'X-Daikin-uuid' in headers else {}),
+    }
+    return redacted_params, redacted_headers
 
 
 class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
@@ -57,12 +71,17 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
 
     @classmethod
     def human_to_daikin(cls, dimension, value):
-        """Return converted values from Human to Daikin."""
+        """Return converted values from Human to Daikin (case-insensitive on value).
+
+        On miss the ORIGINAL value is returned unchanged so daikin-native
+        codes (e.g. 'A') pass through exactly as before.
+        """
         translations_rev = {
-            dim: {v: k for k, v in item.items()}
+            dim: {v.lower(): k for k, v in item.items()}
             for dim, item in cls.TRANSLATIONS.items()
         }
-        return translations_rev.get(dimension, {}).get(value, value)
+        lookup = value.lower() if isinstance(value, str) else value
+        return translations_rev.get(dimension, {}).get(lookup, value)
 
     @classmethod
     def daikin_values(cls, dimension):
@@ -100,14 +119,16 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
                     raise ValueError(f"no device found for {device_id}") from exc
             else:
                 device_ip = device_name['ip']
-        return device_id
+        return device_ip
 
     def __init__(self, device_id, session: Optional[ClientSession] = None) -> None:
         """Init the pydaikin appliance, representing one Daikin device."""
         self.values = ApplianceValues()
+        self._owned_session = session is None
         self.session = session if session is not None else ClientSession()
         self.headers: dict = {}
         self._energy_consumption_history = defaultdict(list)
+        self._last_rejected_ret: dict = {}
         if session:
             self.device_ip = device_id
         else:
@@ -116,6 +137,22 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
         self.base_url = f"http://{self.device_ip}"
 
         self.request_semaphore = asyncio.Semaphore(value=self.MAX_CONCURRENT_REQUESTS)
+
+    async def close(self):
+        """Close the underlying session if this appliance created it.
+
+        Library users that construct an appliance without passing a session
+        should use `async with` or call close() explicitly; sessions passed
+        in (e.g. by Home Assistant) are left untouched.
+        """
+        if self._owned_session and self.session is not None and not self.session.closed:
+            await self.session.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        await self.close()
 
     def __getitem__(self, name):
         """Return values from self.value."""
@@ -128,34 +165,65 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
         # Re-defined in all sub-classes
         raise NotImplementedError
 
-    @retry(
-        reraise=True,
-        wait=wait_random_exponential(multiplier=0.2, max=1.2),
-        stop=stop_after_attempt(3),
-        retry=retry_if_exception_type(
-            (
-                ClientOSError,
-                ClientResponseError,
-                ServerDisconnectedError,
-                ServerTimeoutError,
-                asyncio.TimeoutError,
-            )
-        ),
-        before_sleep=before_sleep_log(_LOGGER, logging.DEBUG),
-    )
-    async def _get_resource(self, path: str, params: Optional[dict] = None):
+    async def _retry_request(
+        self, attempt_coro_factory, *, attempts: int = 2, description: str = ""
+    ):
+        """Run a request coroutine, retrying RETRYABLE_EXCEPTIONS with jitter.
+
+        Shared by Appliance._get_resource and DaikinBRP084._get_resource.
+        Budget note: worst case PER REQUEST is attempts x 20s HTTP timeout
+        (+ ~1s jitter). A full BRP069 set() issues up to 3 serialized
+        requests (state fetch + set + post-set refresh), so the command-
+        critical requests (fetch + set, attempts=2 each) stay under the
+        HA integration's 60s wait_for except when the device genuinely
+        fails twice per request. Polls use attempts=1 — the coordinator's
+        10s cadence is the retry loop.
+        """
+        attempts = max(1, attempts)
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                return await attempt_coro_factory()
+            except (
+                RETRYABLE_EXCEPTIONS
+            ) as exc:  # pylint: disable=catching-non-exception
+                last_exc = exc
+                if attempt + 1 < attempts:
+                    _LOGGER.debug(
+                        "Retrying %s after %r (attempt %d/%d)",
+                        description,
+                        exc,
+                        attempt + 1,
+                        attempts,
+                    )
+                    await asyncio.sleep(random.uniform(0.2, 1.2))
+        raise last_exc
+
+    async def _get_resource(
+        self, path: str, params: Optional[dict] = None, *, attempts: int = 2
+    ):
         """Make the http request."""
         if params is None:
             params = {}
 
-        _LOGGER.debug(
-            "Calling: %s/%s %s [%s]",
-            self.base_url,
-            path,
-            params if "pass" not in params else {**params, **{"pass": "****"}},
-            self.headers,
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            log_params, log_headers = _redact(params, self.headers)
+            _LOGGER.debug(
+                "Calling: %s/%s %s [%s]",
+                self.base_url,
+                path,
+                log_params,
+                log_headers,
+            )
+
+        return await self._retry_request(
+            lambda: self._get_resource_once(path, params),
+            attempts=attempts,
+            description=f"{self.base_url}/{path}",
         )
 
+    async def _get_resource_once(self, path: str, params: dict):
+        """Single attempt of the http request."""
         # cannot manage session on outer async with or this will close the session
         # passed to pydaikin (homeassistant for instance)
         try:
@@ -173,10 +241,14 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
                 ) as response:
                     _LOGGER.debug(
                         "HTTP RESPONSE: %s/%s status=%s",
-                        self.base_url, path, response.status
+                        self.base_url,
+                        path,
+                        response.status,
                     )
                     if response.status == 403:
-                        raise HTTPForbidden(reason=f"HTTP 403 Forbidden for {response.url}")
+                        raise HTTPForbidden(
+                            reason=f"HTTP 403 Forbidden for {response.url}"
+                        )
                     # Airbase returns a 404 response on invalid urls but requires fallback
                     if response.status == 404:
                         _LOGGER.debug("HTTP 404 Not Found for %s", response.url)
@@ -191,32 +263,40 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
                         )
                     response.raise_for_status()
                     result = self.parse_response(await response.text())
-                    _LOGGER.debug(
-                        "HTTP REQUEST COMPLETE: %s/%s",
-                        self.base_url, path
-                    )
+                    _LOGGER.debug("HTTP REQUEST COMPLETE: %s/%s", self.base_url, path)
                     return result
         except asyncio.CancelledError:
             _LOGGER.warning(
                 "HTTP REQUEST CANCELLED: %s/%s - Task was cancelled externally",
-                self.base_url, path
+                self.base_url,
+                path,
             )
             raise
         except asyncio.TimeoutError:
             _LOGGER.warning(
                 "HTTP REQUEST TIMEOUT: %s/%s - Request timed out after 20s",
-                self.base_url, path
+                self.base_url,
+                path,
             )
             raise
         except Exception as e:
             _LOGGER.warning(
                 "HTTP REQUEST ERROR: %s/%s - %s: %s",
-                self.base_url, path, type(e).__name__, e
+                self.base_url,
+                path,
+                type(e).__name__,
+                e,
             )
             raise
 
     async def update_status(self, resources=None):
-        """Update status from resources."""
+        """Update status from resources.
+
+        Applies every successfully fetched resource, then raises the first
+        failure so callers see a failed poll. The raise is load-bearing:
+        it feeds HA entity availability and arms the coordinator-recovery
+        reconnect grace in the integration.
+        """
         if resources is None:
             resources = self.get_info_resources()
         resources = [
@@ -226,27 +306,61 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
         ]
         _LOGGER.debug("Updating %s", resources)
 
-        tasks_failed = False
-        try:
-            async with asyncio.TaskGroup() as tg:
-                tasks = [
-                    tg.create_task(self._get_resource(resource))
-                    for resource in resources
-                ]
-        except ExceptionGroup as eg:
-            tasks_failed = True
-            # Log all exceptions
-            for exc in eg.exceptions:
-                _LOGGER.error("Exception in TaskGroup: %s", exc)
-            # If ALL tasks failed, we should re-raise to indicate complete failure
-            if len(eg.exceptions) == len(tasks):
-                _LOGGER.error("All resource requests failed for device %s", self.device_ip)
-                raise eg.exceptions[0] from eg
+        # gather(return_exceptions=True) rather than TaskGroup: TaskGroup
+        # cancels siblings on first failure, losing their results and hiding
+        # total outages (cancelled tasks are absent from eg.exceptions).
+        results = await asyncio.gather(
+            *(self._get_resource(resource, attempts=1) for resource in resources),
+            return_exceptions=True,
+        )
 
-        # Only process results if TaskGroup completed successfully
-        if not tasks_failed:
-            for resource, task in zip(resources, tasks):
-                self.values.update_by_resource(resource, task.result())
+        failures = []
+        for resource, result in zip(resources, results):
+            if isinstance(result, BaseException):
+                failures.append((resource, result))
+                continue
+            if 'ret' in result:
+                # Device explicitly rejected this resource (ret != OK).
+                # Skip the merge so the marker never enters values — the
+                # factory's protocol probing relies on values staying empty
+                # when every resource is rejected. Warn once per distinct
+                # ret value, debug thereafter (a persistently-rejected
+                # resource is re-polled every cycle).
+                if self._last_rejected_ret.get(resource) != result['ret']:
+                    self._last_rejected_ret[resource] = result['ret']
+                    _LOGGER.warning(
+                        "Resource %s rejected by device: ret=%s",
+                        resource,
+                        result['ret'],
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Resource %s still rejected by device: ret=%s",
+                        resource,
+                        result['ret'],
+                    )
+                continue
+            self._last_rejected_ret.pop(resource, None)
+            self.values.update_by_resource(resource, result)
+
+        if failures:
+            for resource, exc in failures:
+                _LOGGER.warning(
+                    "Failed to update resource %s for %s: %r",
+                    resource,
+                    self.device_ip,
+                    exc,
+                )
+            if len(failures) == len(resources):
+                _LOGGER.error(
+                    "All %d resource requests failed for device %s",
+                    len(resources),
+                    self.device_ip,
+                )
+            for _, exc in failures:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise exc
+            raise failures[0][1]
 
         self._register_energy_consumption_history()
 
@@ -263,7 +377,7 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
 
         for key in keys:
             if key in self.values:
-                (k, val) = self.represent(key)
+                k, val = self.represent(key)
                 print(f"{k : >20}: {val}")
 
     def log_sensors(self, file):
@@ -296,29 +410,56 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
 
     def show_sensors(self):
         """Print sensors."""
+
+        def fmt(label, value, spec='.0f', unit=''):
+            if value is None:
+                return f'{label}=n/a'
+            return f'{label}={value:{spec}}{unit}'
+
         data = [
             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            f'in_temp={int(self.inside_temperature)}°C',
+            fmt('in_temp', self.inside_temperature, unit='°C'),
         ]
         if self.support_outside_temperature:
-            data.append(f'out_temp={int(self.outside_temperature)}°C')
+            data.append(fmt('out_temp', self.outside_temperature, unit='°C'))
         if self.support_compressor_frequency:
-            data.append(f'cmp_freq={int(self.compressor_frequency)}Hz')
+            data.append(fmt('cmp_freq', self.compressor_frequency, unit='Hz'))
         if self.support_filter_dirty:
-            data.append(f'en_filter_sign={int(self.filter_dirty)}')
+            data.append(fmt('en_filter_sign', self.filter_dirty))
         if self.support_energy_consumption:
             data.append(
-                f'total_today={self.energy_consumption(ATTR_TOTAL, TIME_TODAY):.01f}kWh'
+                fmt(
+                    'total_today',
+                    self.energy_consumption(ATTR_TOTAL, TIME_TODAY),
+                    '.01f',
+                    'kWh',
+                )
             )
             data.append(
-                f'cool_today={self.energy_consumption(ATTR_COOL, TIME_TODAY):.01f}kWh'
+                fmt(
+                    'cool_today',
+                    self.energy_consumption(ATTR_COOL, TIME_TODAY),
+                    '.01f',
+                    'kWh',
+                )
             )
             data.append(
-                f'heat_today={self.energy_consumption(ATTR_HEAT, TIME_TODAY):.01f}kWh'
+                fmt(
+                    'heat_today',
+                    self.energy_consumption(ATTR_HEAT, TIME_TODAY),
+                    '.01f',
+                    'kWh',
+                )
             )
-            data.append(f'total_power={self.current_total_power_consumption:.02f}kW')
-            data.append(f'cool_energy={self.last_hour_cool_energy_consumption:.01f}kW')
-            data.append(f'heat_energy={self.last_hour_heat_energy_consumption:.01f}kW')
+            data.append(
+                fmt('total_power', self.current_total_power_consumption, '.02f', 'kW')
+            )
+            data.append(
+                fmt('cool_energy', self.last_hour_cool_energy_consumption, '.01f', 'kW')
+            )
+            data.append(
+                fmt('heat_energy', self.last_hour_heat_energy_consumption, '.01f', 'kW')
+            )
         print('  '.join(data))
 
     def represent(self, key):
@@ -328,7 +469,7 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
         # adapt the value
         val = self.values.get(key)
 
-        if key == 'mode' and self.values['pow'] == '0':
+        if key == 'mode' and self.values.get('pow') == '0':
             val = 'off'
         elif key == 'mac':
             val = self.translate_mac(val)
@@ -389,10 +530,9 @@ class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
     @property
     def support_filter_dirty(self) -> bool:
         """Return True if the device supports dirty filter notification and it is turned on."""
+        value = self._parse_number('en_filter_sign')
         return (
-            'en_filter_sign' in self.values
-            and 'filter_sign_info' in self.values
-            and int(self._parse_number('en_filter_sign')) == 1
+            value is not None and 'filter_sign_info' in self.values and int(value) == 1
         )
 
     @property

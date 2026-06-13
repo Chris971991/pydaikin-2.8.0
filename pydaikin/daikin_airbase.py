@@ -73,10 +73,12 @@ class DaikinAirBase(DaikinBRP069):
         if self.values.get("model", None) == "NOTSUPPORT":
             self.values["model"] = "Airbase BRP15B61"
 
-    async def _get_resource(self, path: str, params: Optional[dict] = None):
+    async def _get_resource(
+        self, path: str, params: Optional[dict] = None, *, attempts: int = 2
+    ):
         """Make the http request."""
         path = f"skyfi/{path}"
-        return await super()._get_resource(path, params)
+        return await super()._get_resource(path, params, attempts=attempts)
 
     @property
     def support_away_mode(self):
@@ -183,10 +185,7 @@ class DaikinAirBase(DaikinBRP069):
         _LOGGER.debug("Sending request to %s with params: %s", path, params)
         await self._get_resource(path, params)
 
-        return {
-            'detected_power_off': detected_power_off,
-            'current_val': current_val
-        }
+        return {'detected_power_off': detected_power_off, 'current_val': current_val}
 
     def represent(self, key):
         """Return translated value from key."""

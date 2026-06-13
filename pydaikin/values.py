@@ -8,9 +8,16 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class ApplianceValues(MutableMapping):
-    """Appliance's values dict container keeping track of which values have been actually useful."""
+    """Appliance's values dict container keeping track of which values have been actually useful.
 
-    # If a none of one resource's key are used, the resource will be updated every 15 minutes
+    Refresh contract: get() with invalidate=True (the default) marks the
+    value's backing resource as in-use so update_status refreshes it on the
+    next poll. Resources nobody reads decay to a TTL (15-minute) refresh
+    cadence. This invalidation-on-read is load-bearing for the 10s
+    coordinator poll in Home Assistant — do NOT flip the default.
+    """
+
+    # If none of one resource's keys are used, the resource is only updated every TTL
     TTL = timedelta(minutes=15)
 
     def __init__(self):
@@ -21,8 +28,8 @@ class ApplianceValues(MutableMapping):
     # --- Implementation of abstract methods ---
 
     def __getitem__(self, key):
-        # Return the value without invalidating - use get(key, invalidate=True) to force refresh
-        # Previously this invalidated on every read, causing excessive API calls
+        # Never invalidates. Use get(key) (invalidate=True default) for reads
+        # that should keep the backing resource refreshing on every poll.
         return self._data[key]
 
     def __setitem__(self, key, value):
@@ -46,7 +53,13 @@ class ApplianceValues(MutableMapping):
     def get(
         self, key: str, default=None, *, invalidate: bool = True
     ):  # pylint: disable=arguments-differ
-        """Get a value and invalidate it so that the associated resource will soon be updated."""
+        """Get a value; by default mark its backing resource as in-use.
+
+        invalidate=True (default) pops the resource's last-update stamp so
+        update_status refreshes it on the next poll. Pass invalidate=False
+        for passive reads (display, support_* checks) that should not force
+        a refresh.
+        """
         if key not in self._data:
             return default
         if invalidate and key in self._resource_by_key:

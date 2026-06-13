@@ -7,8 +7,9 @@ from pydaikin.daikin_brp069 import DaikinBRP069
     'body,values',
     [
         (
+            # ret != OK preserves the rejection marker (M3)
             'ret=KO,type=aircon,reg=eu,dst=1',
-            dict(),
+            {'ret': 'KO'},
         ),
         # Response for all fan swing modes http://192.168.3.84/aircon/get_control_info
         (
