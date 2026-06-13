@@ -13,3 +13,8 @@ venv/
 test_response_time.py
 check_office.py
 .claude/settings.local.json
+.pytest_cache/
+.venv*/
+nul
+AUDIT_REPORT_*.md
+fix-plan/
