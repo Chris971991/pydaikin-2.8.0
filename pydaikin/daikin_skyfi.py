@@ -100,8 +100,10 @@ class DaikinSkyFi(Appliance):
     def parse_response(response_body):
         """Parse response from Daikin and map it to general Daikin format."""
         _LOGGER.debug("Parsing response %s", response_body)
-        response = dict([e.split('=') for e in response_body.split('&')])
-        if response.get('fanflags') == '3':
+        # maxsplit=1 keeps '=' inside values intact; the '=' filter makes an
+        # empty body parse to {} instead of crashing on a value-less segment
+        response = dict(e.split('=', 1) for e in response_body.split('&') if '=' in e)
+        if response.get('fanflags') == '3' and 'fanspeed' in response:
             response['fanspeed'] = str(int(response['fanspeed']) + 4)
         response.update(
             {
@@ -151,13 +153,13 @@ class DaikinSkyFi(Appliance):
         # Capture current power state before we change it
         device_was_off = self.values.get('opmode') == '0'
 
-        # Merge current_val with mapped settings
-        self.values.update(
-            {
-                self.DAIKIN_TO_SKYFI[k]: self.human_to_daikin(k, v)
-                for k, v in settings.items()
-            }
-        )
+        # Merge current_val with mapped settings, skipping (with a warning)
+        # any settings key SkyFi has no parameter for (e.g. 'f_dir')
+        for k, v in settings.items():
+            if k not in self.DAIKIN_TO_SKYFI:
+                _LOGGER.warning("SkyFi does not support setting %r; ignored", k)
+                continue
+            self.values[self.DAIKIN_TO_SKYFI[k]] = self.human_to_daikin(k, v)
         _LOGGER.debug("Updated values: %s", self.values)
 
         # we are using an extra mode "off" to power off the unit
@@ -197,7 +199,14 @@ class DaikinSkyFi(Appliance):
 
     @property
     def zones(self):
-        """Return list of zones."""
+        """Return list of zones.
+
+        Zones still carrying the factory placeholder name ('Zone <n>') are
+        filtered out; only renamed (i.e. actually configured) zones are
+        returned. The filter compares the zone NAME (v[0]) — comparing the
+        whole (name, onoff) tuple never matched, so placeholders previously
+        always leaked through.
+        """
         if 'nz' not in self.values:
             return False  # pragma: no cover
         return [
@@ -208,7 +217,7 @@ class DaikinSkyFi(Appliance):
                     for i, onoff in enumerate(self.represent('zone')[1])
                 ]
             )
-            if v != f'Zone {i + 1}'
+            if v[0] != f'Zone {i + 1}'
         ]
 
     async def set_zone(self, zone_id, key, value):

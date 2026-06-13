@@ -242,7 +242,8 @@ class DaikinPowerMixin:
                 # We know that the power will be cut off once the exp_diff_time is
                 # surpassed. Note this can result in negative value of energy_to_log
                 # when the exp_diff_timehas been over-estimated.
-                energy_to_log -= max(est_power, min_power) * (
+                # min_power=None means 'no floor' (same as the guards below).
+                energy_to_log -= max(est_power, min_power or 0.0) * (
                     min(exp_diff_time, diff_time).total_seconds() / 3600
                 )
 
@@ -265,7 +266,13 @@ class DaikinPowerMixin:
             # current power
             if diff_energy is not None:
                 energy_to_log += diff_energy
-            est_power = energy_to_log / (exp_diff_time.total_seconds() / 3600)
+            exp_diff_seconds = exp_diff_time.total_seconds()
+            if exp_diff_seconds <= 0:
+                # Two history states sharing a timestamp carry no slope
+                # information; skip the degenerate pair (also bypassing the
+                # margin mutation below for it) instead of dividing by zero.
+                continue
+            est_power = energy_to_log / (exp_diff_seconds / 3600)
             est_power = max(est_power, 0)
 
             # We add some margins to the exp_diff_time AFTER the est_power computation

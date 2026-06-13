@@ -246,13 +246,7 @@ class FakeDaikinServer:
             await self.runner.cleanup()
 
 
-@pytest.mark.xfail(
-    reason="First-ever run of this test (was silently skipped) exposed factory "
-    "detection rot: firmware280 fake-server fixture no longer matches current "
-    "BRP084 endpoints, and the skyfi path errors with 'not supported'. "
-    "Revisit with the Phase 1 factory items (audit B:M1) and BRP084 chain.",
-    strict=False,
-)
+@pytest.mark.asyncio
 async def test_device_factory():
     """Test that the factory correctly identifies different device types."""
     results = []
@@ -262,8 +256,8 @@ async def test_device_factory():
         server = FakeDaikinServer(device_type)
         base_url = await server.start()
 
+        device = None
         try:
-            device = None
             # SkyFi needs a password
             if device_type == "skyfi":
                 device = await DaikinFactory(
@@ -312,6 +306,10 @@ async def test_device_factory():
                 }
             )
         finally:
+            if device is not None:
+                # Factory was called with session=None, so the returned
+                # device owns its ClientSession.
+                await device.close()
             await server.stop()
 
     # Print summary

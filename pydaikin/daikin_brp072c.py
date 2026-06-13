@@ -29,22 +29,27 @@ class DaikinBRP072C(DaikinBRP069):
             uuid = uuid3(NAMESPACE_OID, 'pydaikin')
         self._uuid = str(uuid).replace('-', '')
         self.headers = {"X-Daikin-uuid": self._uuid}
-        self.ssl_context = (
-            ssl_context
-            if ssl_context
-            else ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        )
-        # SSL_OP_LEGACY_SERVER_CONNECT, https://github.com/python/cpython/issues/89051
-        self.ssl_context.options |= 0x4
-        self.ssl_context.check_hostname = False
-        self.ssl_context.verify_mode = ssl.CERT_NONE
-        # Lower security level to allow legacy Daikin SSL/TLS configurations
-        # Fixes HA 2025.10 SSL WRONG_SIGNATURE_TYPE error
-        # See: https://github.com/home-assistant/core/issues/153385
-        try:
-            self.ssl_context.set_ciphers('DEFAULT:@SECLEVEL=0')
-        except Exception:
-            pass  # Fallback for systems that don't support SECLEVEL
+        if ssl_context is not None:
+            # Caller-supplied context is used as-is: the caller owns its
+            # configuration and may share it — never mutate it here.
+            # (Callers needing legacy Daikin TLS must apply the hardening
+            # below themselves, e.g. options |= 0x4 for
+            # SSL_OP_LEGACY_SERVER_CONNECT.)
+            self.ssl_context = ssl_context
+        else:
+            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            # SSL_OP_LEGACY_SERVER_CONNECT, https://github.com/python/cpython/issues/89051
+            context.options |= 0x4
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            # Lower security level to allow legacy Daikin SSL/TLS configurations
+            # Fixes HA 2025.10 SSL WRONG_SIGNATURE_TYPE error
+            # See: https://github.com/home-assistant/core/issues/153385
+            try:
+                context.set_ciphers('DEFAULT:@SECLEVEL=0')
+            except ssl.SSLError:
+                pass  # Fallback for systems that don't support SECLEVEL=0
+            self.ssl_context = context
         self.base_url = f"https://{self.device_ip}"
 
     async def init(self):

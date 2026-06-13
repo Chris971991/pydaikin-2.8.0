@@ -1,12 +1,14 @@
 "Factory to generate Pydaikin complete objects"
 
+import asyncio
+import ipaddress
 import logging
 import re
+import socket
 from typing import Optional, Tuple
 
-from aiohttp import ClientSession
-from aiohttp.client_exceptions import ClientOSError
-from aiohttp.web_exceptions import HTTPNotFound
+from aiohttp import ClientError, ClientSession
+from aiohttp.web_exceptions import HTTPForbidden
 
 from .daikin_airbase import DaikinAirBase
 from .daikin_base import Appliance
@@ -14,10 +16,19 @@ from .daikin_brp069 import DaikinBRP069
 from .daikin_brp072c import DaikinBRP072C
 from .daikin_brp084 import DaikinBRP084
 from .daikin_skyfi import DaikinSkyFi
-from .discovery import get_name
+from .discovery import UDP_DST_PORT, get_name
 from .exceptions import DaikinException
 
 _LOGGER = logging.getLogger(__name__)
+
+# Exceptions that legitimately escape a detection probe or init():
+# - DaikinException: protocol-level failures (already contextualized)
+# - ClientError: aiohttp base for connection failures and 5xx
+#   (ClientOSError, ClientResponseError, ServerDisconnectedError, ...)
+# - HTTPForbidden: 403 probe against the wrong protocol
+# - asyncio.TimeoutError: request timeout after retries
+# CancelledError is a BaseException and still propagates.
+_PROBE_EXCEPTIONS = (DaikinException, ClientError, HTTPForbidden, asyncio.TimeoutError)
 
 
 class DaikinFactory:  # pylint: disable=too-few-public-methods
@@ -41,11 +52,21 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
     ) -> None:
         """Factory to init the corresponding Daikin class."""
 
-        # Check if this is a device with optional port from discovery
-        device_ip, device_port = self._extract_ip_port(device_id)
+        # Resolve IP literals / explicit ports synchronously; only fall back
+        # to (blocking) UDP discovery for plain names, off the event loop.
+        resolved = self._extract_ip_port(device_id)
+        if resolved is None:
+            resolved = await asyncio.get_running_loop().run_in_executor(
+                None, self._discovery_lookup, device_id
+            )
+        device_ip, device_port = resolved
 
         if password is not None:
             self._generated_object = DaikinSkyFi(device_ip, session, password)
+            if device_port:
+                # An explicit :port in device_id overrides SkyFi's default 2000
+                _LOGGER.debug("Using custom port %s for SkyFi", device_port)
+                self._generated_object.base_url = f"http://{device_ip}:{device_port}"
         elif key is not None:
             self._generated_object = DaikinBRP072C(
                 device_ip,
@@ -59,6 +80,17 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
             try:
                 _LOGGER.debug("Trying connection to firmware 2.8.0")
                 self._generated_object = DaikinBRP084(device_ip, session)
+
+                # If we have a specific port from discovery, set it in the base_url
+                if device_port and device_port != 80:
+                    _LOGGER.debug("Using custom port %s for BRP084", device_port)
+                    self._generated_object.base_url = (
+                        f"http://{device_ip}:{device_port}"
+                    )
+                    self._generated_object.url = (
+                        f"{self._generated_object.base_url}/dsiot/multireq"
+                    )
+
                 try:
                     await self._generated_object.update_status()
                     # If we get here, it's likely a 2.8.0 device
@@ -74,8 +106,11 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
                     )
                     # Use from e to properly chain exceptions
                     raise DaikinException(f"Not a firmware 2.8.0 device: {e}") from e
-            except (HTTPNotFound, DaikinException) as err:
+            except DaikinException as err:
                 _LOGGER.debug("Not a firmware 2.8.0 device: %s", err)
+                # Close the discarded candidate's owned session (no-op when
+                # the caller supplied a session).
+                await self._generated_object.close()
 
             # Try BRP069
             try:
@@ -94,8 +129,9 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
                 )
                 if not self._generated_object.values:
                     raise DaikinException("Empty Values.")
-            except (HTTPNotFound, DaikinException, ClientOSError) as err:
+            except _PROBE_EXCEPTIONS as err:
                 _LOGGER.debug("Falling back to AirBase: %s", err)
+                await self._generated_object.close()
                 self._generated_object = DaikinAirBase(device_ip, session)
 
                 # If we have a specific port from discovery, set it in the base_url
@@ -116,8 +152,9 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
                             "The device may be offline or unreachable. "
                             "Please check the device network connection and try again."
                         )
-                except (HTTPNotFound, DaikinException, ClientOSError) as airbase_err:
+                except _PROBE_EXCEPTIONS as airbase_err:
                     # All device types failed - device is likely offline
+                    await self._generated_object.close()
                     raise DaikinException(
                         f"Unable to connect to Daikin device at {device_ip}. "
                         f"The device appears to be offline or unreachable. "
@@ -127,15 +164,20 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
 
         try:
             await self._generated_object.init()
-        except DaikinException as e:
-            # Re-raise with more context about which device type failed
+        except _PROBE_EXCEPTIONS as e:
+            # Re-raise with more context about which device type failed.
+            # Catches the original exception types update_status re-raises
+            # (timeouts, aiohttp errors) so HA's config flow / setup sees a
+            # DaikinException instead of a raw traceback.
             device_type = type(self._generated_object).__name__
+            await self._generated_object.close()
             raise DaikinException(
                 f"Failed to initialize {device_type} device at {device_ip}: {e}. "
                 f"The device may be offline or unreachable."
             ) from e
 
         if not self._generated_object.values.get("mode"):
+            await self._generated_object.close()
             raise DaikinException(
                 f"Error creating device, {device_id} is not supported."
             )
@@ -143,20 +185,49 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
         _LOGGER.debug("Daikin generated object: %s", self._generated_object)
 
     @staticmethod
-    def _extract_ip_port(device_id: str) -> Tuple[str, Optional[int]]:
-        """Extract IP and optional port from device_id string or lookup via discovery."""
-        # Check if there's a port specified in the device_id
+    def _extract_ip_port(device_id: str) -> Optional[Tuple[str, Optional[int]]]:
+        """Extract (host, port) from device_id without any network I/O.
+
+        Order matters: the IP-literal check runs first so bare IPv6
+        addresses like '::1' are not mangled by the port regex. Returns
+        None as a 'needs discovery' sentinel for plain names.
+        """
+        try:
+            ipaddress.ip_address(device_id)
+            return device_id, None
+        except ValueError:
+            pass
+
         port_match = re.match(r'^(.+):(\d+)$', device_id)
         if port_match:
             return port_match.group(1), int(port_match.group(2))
 
-        # Try to look up device in discovery
-        try:
-            device_name = get_name(device_id)
-            if device_name and 'port' in device_name:
-                return device_name['ip'], int(device_name['port'])
-        except (KeyError, ValueError, TypeError) as e:
-            _LOGGER.debug("Error looking up device in discovery: %s", e)
+        return None
 
-        # Default: just return the IP with no port
+    @staticmethod
+    def _discovery_lookup(device_id: str) -> Tuple[str, Optional[int]]:
+        """Resolve a device name via UDP discovery (blocking; run in executor).
+
+        The advertised 'port' from basic_info is treated as an HTTP port
+        only when it differs from the UDP discovery port: real adapters
+        advertise port=30050 (the UDP port itself), which is never a valid
+        HTTP port, so it maps to None (default 80).
+        """
+        try:
+            entry = get_name(device_id)
+            if entry:
+                port = int(entry['port']) if 'port' in entry else None
+                if port == UDP_DST_PORT:
+                    port = None
+                return entry['ip'], port
+        except (KeyError, ValueError, TypeError, OSError) as exc:
+            _LOGGER.debug("Discovery lookup failed for %s: %s", device_id, exc)
+
+        # Fall back to DNS while still inside the executor, so session=None
+        # construction does not block the event loop in discover_ip later.
+        try:
+            return socket.gethostbyname(device_id), None
+        except OSError as exc:
+            _LOGGER.debug("DNS lookup failed for %s: %s", device_id, exc)
+
         return device_id, None

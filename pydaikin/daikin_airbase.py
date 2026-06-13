@@ -107,15 +107,29 @@ class DaikinAirBase(DaikinBRP069):
 
     @property
     def fan_rate(self):
-        """Return list of supported fan rates."""
-        fan_rates = list(map(str.title, self.TRANSLATIONS.get("f_rate", {}).values()))
+        """Return list of supported fan rates.
+
+        Key-based selection from TRANSLATIONS so the intent is explicit:
+        2-step units lack 'Mid' (and its auto variant); units without
+        fan-auto lack every 'Auto' entry.
+        """
+        titled = {k: v.title() for k, v in self.TRANSLATIONS.get("f_rate", {}).items()}
         if self.values.get("frate_steps") == "2":
             if self.values.get("en_frate_auto") == "0":
-                return fan_rates[1:4:2]
-            return fan_rates[:3:2] + fan_rates[3::2]
-        if self.values.get("en_frate_auto") == "0":
-            return fan_rates[1:4]
-        return fan_rates
+                keys = ("1", "5")  # Low, High
+            else:
+                keys = (
+                    "0",
+                    "1",
+                    "5",
+                    "1a",
+                    "5a",
+                )  # Auto, Low, High, Low/Auto, High/Auto
+        elif self.values.get("en_frate_auto") == "0":
+            keys = ("1", "3", "5")  # Low, Mid, High
+        else:
+            keys = tuple(titled)  # all
+        return [titled[k] for k in keys if k in titled]
 
     async def _update_settings(self, settings):
         """Update settings to set on Daikin device."""
@@ -147,8 +161,15 @@ class DaikinAirBase(DaikinBRP069):
 
         return current_val
 
-    async def set(self, settings):
+    async def set(self, settings, expected_pow=None):
         """Set settings on Daikin device.
+
+        Args:
+            settings: dict of settings to apply
+            expected_pow: accepted for API compatibility with the other
+                appliance classes; AirBase relies on coordinator polling
+                for physical remote detection, so no abort logic is tied
+                to this parameter.
 
         Returns:
             dict with 'detected_power_off' (bool) and 'current_val' (dict)
@@ -167,7 +188,11 @@ class DaikinAirBase(DaikinBRP069):
                 "Someone may have turned off AC via physical remote."
             )
 
-        self.values.setdefault("f_airside", 0)
+        # String defaults: every other value in the params dict is a string,
+        # and real units whose get_control_info omits f_auto would otherwise
+        # raise KeyError below.
+        self.values.setdefault("f_airside", "0")
+        self.values.setdefault("f_auto", "0")
 
         path = "aircon/set_control_info"
         params = {
@@ -183,7 +208,12 @@ class DaikinAirBase(DaikinBRP069):
         }
 
         _LOGGER.debug("Sending request to %s with params: %s", path, params)
-        await self._get_resource(path, params)
+        response = await self._get_resource(path, params)
+        if 'ret' in response:
+            raise DaikinException(
+                f"Device rejected set_control_info (ret={response['ret']}); "
+                f"params={params}"
+            )
 
         return {'detected_power_off': detected_power_off, 'current_val': current_val}
 
@@ -209,6 +239,14 @@ class DaikinAirBase(DaikinBRP069):
             :enabled_zones
         ]  # Slicing to limit zones
         if self.support_zone_temperature:
+
+            def _to_float(value):
+                """Guard against placeholder temps ('M'/'--') in fan/dry mode."""
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return 0
+
             mode = self.values["mode"]
 
             if mode == "3":
@@ -222,7 +260,7 @@ class DaikinAirBase(DaikinBRP069):
                 zone_temp = [self.values["stemp"]] * len(zone_list)
 
             return [
-                (name.strip(" +,"), zone_onoff[i], float(zone_temp[i]))
+                (name.strip(" +,"), zone_onoff[i], _to_float(zone_temp[i]))
                 for i, name in enumerate(zone_list)
             ]
 

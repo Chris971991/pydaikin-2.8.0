@@ -2,14 +2,13 @@
 
 import asyncio
 from dataclasses import dataclass, field
-import json
 import logging
 from typing import Any, Dict, List, Optional
 
 from aiohttp import ClientSession
 
 from .daikin_base import Appliance
-from .exceptions import DaikinException
+from .exceptions import DaikinException, DaikinRejectedValueError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,7 +63,10 @@ class DaikinRequest:
                 index = get_existing_index(pn, entry)
                 if index == -1:
                     entry.append({"pn": pn, "pch": []})
-                entry = entry[-1]['pch']
+                    index = len(entry) - 1
+                # Descend into the MATCHED node, not the last node, so
+                # interleaved paths graft values under the right branch.
+                entry = entry[index]['pch']
             entry.append(attribute.format())
         return payload
 
@@ -92,14 +94,14 @@ class DaikinBRP084(Appliance):
         # Mode-specific paths for temperature settings
         "temp_settings": {
             "cool": _E_1002_E_3001_BASE + ["p_02"],
-            "heat": _E_1002_E_3001_BASE + ["p_03"],
+            "hot": _E_1002_E_3001_BASE + ["p_03"],
             "auto": _E_1002_E_3001_BASE + ["p_1D"],
         },
         # Fan settings organized by mode
         "fan_settings": {
             "auto": _E_1002_E_3001_BASE + ["p_26"],
             "cool": _E_1002_E_3001_BASE + ["p_09"],
-            "heat": _E_1002_E_3001_BASE + ["p_0A"],
+            "hot": _E_1002_E_3001_BASE + ["p_0A"],
             "fan": _E_1002_E_3001_BASE + ["p_28"],
         },
         # Swing settings organized by mode
@@ -112,7 +114,7 @@ class DaikinBRP084(Appliance):
                 "vertical": _E_1002_E_3001_BASE + ["p_05"],
                 "horizontal": _E_1002_E_3001_BASE + ["p_06"],
             },
-            "heat": {
+            "hot": {
                 "vertical": _E_1002_E_3001_BASE + ["p_07"],
                 "horizontal": _E_1002_E_3001_BASE + ["p_08"],
             },
@@ -136,7 +138,10 @@ class DaikinBRP084(Appliance):
         'mode': {
             '0300': 'auto',
             '0200': 'cool',
-            '0100': 'heat',
+            # Canonical name is 'hot' (same dialect as BRP069/AirBase/SkyFi
+            # and HA core's DAIKIN_TO_HA_STATE); 'heat' is accepted as an
+            # alias in set().
+            '0100': 'hot',
             '0000': 'fan',
             '0500': 'dry',
             '00': 'off',
@@ -167,7 +172,7 @@ class DaikinBRP084(Appliance):
     MODE_MAP = {
         '0300': 'auto',
         '0200': 'cool',
-        '0100': 'heat',
+        '0100': 'hot',
         '0000': 'fan',
         '0500': 'dry',
     }
@@ -232,8 +237,11 @@ class DaikinBRP084(Appliance):
 
     @staticmethod
     def temp_to_hex(temperature: float, divisor=2) -> str:
-        """Convert temperature to hexadecimal."""
-        return format(int(temperature * divisor), '02x')
+        """Convert temperature to hexadecimal (two's complement for negatives)."""
+        value = round(temperature * divisor)
+        if value < 0:
+            value += 256
+        return format(value, '02x')
 
     @staticmethod
     def hex_to_int(value: str) -> int:
@@ -248,17 +256,20 @@ class DaikinBRP084(Appliance):
         if 'responses' not in data:
             raise DaikinException("No 'responses' key in data")
 
-        data = [x['pc'] for x in data['responses'] if x['fr'] == fr]
+        # Failed sub-responses (rsc 4000-series) carry 'fr'/'rsc' but no 'pc';
+        # filter them (and entries lacking 'fr') so a failed sub-response
+        # surfaces as DaikinException via the not-found path, never KeyError.
+        data = [x['pc'] for x in data['responses'] if x.get('fr') == fr and 'pc' in x]
 
         while keys:
             current_key = keys[0]
             keys = keys[1:]
             found = False
             for pcs in data:
-                if pcs['pn'] == current_key:
+                if pcs.get('pn') == current_key:
                     if not keys:
                         return pcs['pv']
-                    data = pcs['pch']
+                    data = pcs.get('pch', [])
                     found = True
                     break
             if not found:
@@ -311,15 +322,16 @@ class DaikinBRP084(Appliance):
         }
 
         try:
-            response = await self._get_resource("", params=payload)
+            # attempts=1: polls never retry in-call; the coordinator's 10s
+            # cadence is the retry loop.
+            response = await self._get_resource("", params=payload, attempts=1)
 
             if not response or 'responses' not in response:
                 raise DaikinException("Invalid response from device")
-        except asyncio.TimeoutError as e:
-            _LOGGER.error("Timeout communicating with device at %s", self.device_ip)
-            raise DaikinException(f"Timeout communicating with device at {self.device_ip}") from e
         except DaikinException:
-            raise  # Re-raise DaikinException as-is
+            # Re-raise DaikinException as-is (includes timeouts, which
+            # _get_resource already translates to DaikinException).
+            raise
         except Exception as e:
             error_msg = str(e).strip()
             error_type = type(e).__name__
@@ -345,8 +357,12 @@ class DaikinBRP084(Appliance):
             try:
                 model_hex = self.find_value_by_pn(response, *self.get_path("model"))
                 if model_hex:
-                    self.values['model'] = bytes.fromhex(model_hex).decode('ascii', errors='ignore')
-                    _LOGGER.info(f"Extracted model: {self.values['model']} from hex: {model_hex}")
+                    self.values['model'] = bytes.fromhex(model_hex).decode(
+                        'ascii', errors='ignore'
+                    )
+                    _LOGGER.info(
+                        f"Extracted model: {self.values['model']} from hex: {model_hex}"
+                    )
                 else:
                     self.values['model'] = None
                     _LOGGER.warning("Model hex was empty or None")
@@ -359,22 +375,34 @@ class DaikinBRP084(Appliance):
 
             # Get mode
             mode_value = self.find_value_by_pn(response, *self.get_path("mode"))
+            mode = self.MODE_MAP.get(mode_value)
+            if mode is None:
+                _LOGGER.warning(
+                    "Unknown BRP084 mode code %r; treating as 'auto'", mode_value
+                )
+                mode = 'auto'
 
             self.values['pow'] = "0" if is_off else "1"
-            self.values['mode'] = 'off' if is_off else self.MODE_MAP[mode_value]
+            self.values['mode'] = 'off' if is_off else mode
+            if not is_off:
+                # Latch the underlying mode ONLY when the device confirmed
+                # it is ON; while off the previously latched value is kept
+                # (set() falls back to 'auto' when no latch exists). Used by
+                # the auto power-on path for operational settings while off.
+                self.values['last_active_mode'] = mode
 
             # Get temperatures
             try:
-                outdoor_temp_hex = self.find_value_by_pn(response, *self.get_path("outdoor_temp"))
+                outdoor_temp_hex = self.find_value_by_pn(
+                    response, *self.get_path("outdoor_temp")
+                )
                 if outdoor_temp_hex:
-                    _LOGGER.debug(f"Outdoor temp raw hex: {outdoor_temp_hex}")
-                    # Check if this looks like it's already a decimal value mistakenly treated as hex
-                    if len(outdoor_temp_hex) == 4 and outdoor_temp_hex.startswith('20'):
-                        # This might be the issue - value like "2080" being read as 8320 decimal
-                        # Try treating first 2 chars as signed hex
-                        self.values['otemp'] = str(self.hex_to_temp(outdoor_temp_hex[:2], divisor=2))
-                    else:
-                        self.values['otemp'] = str(self.hex_to_temp(outdoor_temp_hex, divisor=2))
+                    _LOGGER.debug("Outdoor temp raw hex: %s", outdoor_temp_hex)
+                    # hex_to_temp only reads the first byte, so longer values
+                    # (e.g. '2080') need no special-casing.
+                    self.values['otemp'] = str(
+                        self.hex_to_temp(outdoor_temp_hex, divisor=2)
+                    )
                 else:
                     self.values['otemp'] = "--"
             except Exception as e:
@@ -443,28 +471,26 @@ class DaikinBRP084(Appliance):
             _LOGGER.error("Error extracting values: %s", e)
             raise
 
-    async def _get_resource(self, path: str, params: Optional[Dict] = None):
-        """Make the HTTP request to the device."""
-        _LOGGER.debug(
-            "Calling: %s %s",
-            self.url,
-            json.dumps(params) if params else "{}",
-        )
+    async def _get_resource(
+        self, path: str, params: Optional[Dict] = None, *, attempts: int = 2
+    ):
+        """Make the HTTP request to the device, retrying transient errors.
+
+        The retry loop (shared Appliance._retry_request) wraps the raw POST;
+        only the FINAL exception is translated below, so retryable exception
+        types stay visible to the retry filter. update_status passes
+        attempts=1 (the coordinator's 10s cadence is the retry loop); command
+        paths keep the default attempts=2.
+        """
+        # %s formatting is lazy: no serialization cost above DEBUG level.
+        _LOGGER.debug("Calling: %s %s", self.url, params)
 
         try:
-            async with self.request_semaphore:
-                async with self.session.post(
-                    self.url,
-                    json=params,
-                    headers=self.headers,
-                    ssl=self.ssl_context,
-                    timeout=20,  # Match base class timeout for slow/congested networks
-                ) as response:
-                    response.raise_for_status()
-                    json_data = await response.json()
-                    if json_data is None:
-                        raise DaikinException("Device returned null/empty JSON response")
-                    return json_data
+            return await self._retry_request(
+                lambda: self._post_request(params),
+                attempts=attempts,
+                description=self.url,
+            )
         except asyncio.CancelledError:
             # Task was cancelled (e.g., by blueprint restart) - don't log as error
             _LOGGER.debug(
@@ -473,6 +499,8 @@ class DaikinBRP084(Appliance):
             )
             raise  # Re-raise to propagate cancellation
         except asyncio.TimeoutError as e:
+            # Message must keep containing the word 'timeout': the HA
+            # integration's log-level predicate matches on that substring.
             _LOGGER.warning(
                 "Network timeout communicating with device at %s",
                 self.device_ip,
@@ -493,6 +521,22 @@ class DaikinBRP084(Appliance):
             )
             raise
 
+    async def _post_request(self, params: Optional[Dict]):
+        """Single attempt of the multireq POST."""
+        async with self.request_semaphore:
+            async with self.session.post(
+                self.url,
+                json=params,
+                headers=self.headers,
+                ssl=self.ssl_context,
+                timeout=20,  # Match base class timeout for slow/congested networks
+            ) as response:
+                response.raise_for_status()
+                json_data = await response.json()
+                if json_data is None:
+                    raise DaikinException("Device returned null/empty JSON response")
+                return json_data
+
     def _validate_response(self, response: Dict):
         """Validate response status codes from device."""
         if not response or 'responses' not in response:
@@ -507,39 +551,57 @@ class DaikinBRP084(Appliance):
                 continue  # Success codes
             elif rsc == 4000:
                 fr = resp.get('fr', 'unknown')
-                raise DaikinException(f"Device rejected request to {fr} (error code: {rsc})")
+                raise DaikinRejectedValueError(
+                    f"Device rejected request to {fr} (error code: {rsc})"
+                )
             else:
                 fr = resp.get('fr', 'unknown')
                 raise DaikinException(f"Device error for {fr}: code {rsc}")
 
-    async def _set_temperature_with_clipping(self, target_temp: float) -> float:
-        """Set temperature with smart clipping to nearest valid value."""
-        if self.values['mode'] not in self.API_PATHS["temp_settings"]:
-            raise DaikinException(f"Temperature setting not supported in mode: {self.values['mode']}")
+    async def _set_temperature_with_clipping(
+        self, target_temp: float, mode: str
+    ) -> float:
+        """Set temperature with smart clipping to the nearest valid value.
 
-        path = self.get_path("temp_settings", self.values['mode'])
+        Tries the clamped target first (most rejections are out-of-range
+        requests), then walks outward in 0.5°C steps with an upward bias,
+        deduplicated and hard-capped at 8 requests. The caller (set()) does
+        the single trailing status refresh; no refresh happens here.
+        """
+        path = self.get_path("temp_settings", mode)
+        min_temp, max_temp = 16.0, 30.0
+        max_attempts = 8
 
-        # Try the exact temperature first
-        try:
-            await self._try_set_temperature(path, target_temp)
-            # Update status after successful setting
-            await self.update_status()
-            return target_temp
-        except DaikinException as e:
-            if "error code: 4000" not in str(e):
-                raise  # Re-raise non-temperature-range errors
+        # Clamp first: a 12°C request tries 16°C immediately.
+        base = min(max(round(target_temp * 2) / 2, min_temp), max_temp)
+        candidates = [base]
+        offset = 0.5
+        while offset <= 3.0:
+            for sign in (1, -1):
+                candidate = base + sign * offset
+                if min_temp <= candidate <= max_temp:
+                    candidates.append(candidate)
+            offset += 0.5
 
-        # If exact temp failed, try clipping upward first (toward warmer temps)
-        # This handles the common case where requested temp is too cold
-        try:
-            final_temp = await self._search_valid_temperature(path, target_temp, direction=1)
-            await self.update_status()
-            return final_temp
-        except DaikinException:
-            # If that fails, try downward (toward cooler temps)
-            final_temp = await self._search_valid_temperature(path, target_temp, direction=-1)
-            await self.update_status()
-            return final_temp
+        tried = set()
+        attempts = 0
+        for temp in candidates:
+            if temp in tried or attempts >= max_attempts:
+                continue
+            tried.add(temp)
+            attempts += 1
+            try:
+                await self._try_set_temperature(path, temp)
+                return temp
+            except DaikinRejectedValueError:
+                # rsc 4000: value out of range for this device; try the next
+                # candidate. Any other error propagates immediately.
+                continue
+
+        raise DaikinException(
+            f"No valid temperature found near {target_temp:.1f}°C "
+            f"after {attempts} attempts in {mode} mode."
+        )
 
     async def _try_set_temperature(self, path: List[str], temperature: float):
         """Try to set a specific temperature."""
@@ -551,65 +613,6 @@ class DaikinBRP084(Appliance):
         _LOGGER.debug("Trying temperature %.1f°C", temperature)
         response = await self._get_resource("", params=request_payload)
         self._validate_response(response)
-
-    async def _search_valid_temperature(self, path: List[str], start_temp: float, direction: int) -> float:
-        """Search for a valid temperature in the given direction using optimized binary search."""
-        # Reasonable temperature bounds (most AC units support 16-30°C)
-        min_temp, max_temp = 16.0, 30.0
-
-        # First, try just a few nearby temperatures (most likely to succeed)
-        # This handles the common case where device rounds to nearest 0.5 or 1.0
-        quick_tries = [0.5, 1.0, -0.5, -1.0] if direction > 0 else [-0.5, -1.0, 0.5, 1.0]
-
-        for offset in quick_tries:
-            test_temp = start_temp + offset
-            if min_temp <= test_temp <= max_temp:
-                try:
-                    await self._try_set_temperature(path, test_temp)
-                    return test_temp
-                except DaikinException as e:
-                    if "error code: 4000" not in str(e):
-                        raise
-                    continue
-
-        # If quick tries failed, do a linear search in the specified direction
-        current_temp = start_temp
-        for _ in range(10):  # Reduced from 15 for faster failure
-            current_temp += direction * 0.5
-
-            if current_temp < min_temp or current_temp > max_temp:
-                break
-
-            try:
-                await self._try_set_temperature(path, current_temp)
-                return current_temp
-            except DaikinException as e:
-                if "error code: 4000" not in str(e):
-                    raise
-                continue
-
-        # If we get here, no valid temperature was found
-        raise DaikinException(
-            f"No valid temperature found near {start_temp:.1f}°C. "
-            f"Device may have limited temperature range in {self.values['mode']} mode."
-        )
-
-    async def _update_settings(self, settings):
-        """Update settings to set on Daikin device."""
-        # Start with current values
-        _LOGGER.debug("Updating settings: %s", settings)
-
-        # Handle specific translations for this firmware version
-        for key, value in settings.items():
-            if key == 'mode' and value == 'off':
-                self.values['pow'] = '0'
-            elif key == 'mode':
-                self.values['pow'] = '1'
-                self.values['mode'] = value
-            else:
-                self.values[key] = value
-
-        return self.values
 
     def add_request(self, requests, path, value):
         """Append DaikinAttribute to requests."""
@@ -635,68 +638,54 @@ class DaikinBRP084(Appliance):
             mode_path = self.get_path("mode")
             self.add_request(requests, mode_path, mode_value)
 
-    def _handle_temperature_setting(self, settings, requests):
-        """Handle temperature-related settings."""
-        if (
-            'stemp' not in settings
-            or self.values['mode'] not in self.API_PATHS["temp_settings"]
-        ):
+    def _handle_fan_setting(self, settings, requests, mode):
+        """Handle fan-related settings (case-insensitive on f_rate)."""
+        if 'f_rate' not in settings or mode not in self.API_PATHS["fan_settings"]:
             return
 
-        path = self.get_path("temp_settings", self.values['mode'])
-        temp_hex = self.temp_to_hex(float(settings['stemp']))
-        self.add_request(requests, path, temp_hex)
+        path = self.get_path("fan_settings", mode)
 
-    def _handle_fan_setting(self, settings, requests):
-        """Handle fan-related settings."""
-        if (
-            'f_rate' not in settings
-            or self.values['mode'] not in self.API_PATHS["fan_settings"]
-        ):
+        f_rate = str(settings['f_rate']).lower()
+        fan_value = self.REVERSE_FAN_MODE_MAP.get(f_rate)
+        if fan_value is None and f_rate.upper() in self.FAN_MODE_MAP:
+            # Pass-through of raw daikin codes like '0A00'.
+            fan_value = f_rate.upper()
+        if fan_value is None:
+            _LOGGER.warning(
+                "Unsupported f_rate value %r; fan command skipped",
+                settings['f_rate'],
+            )
             return
 
-        path = self.get_path("fan_settings", self.values['mode'])
-        fan_value = None
+        self.add_request(requests, path, fan_value)
 
-        # Try both formats - the internal one and the user-friendly one
-        for key, value in self.FAN_MODE_MAP.items():
-            if value == settings['f_rate'] or key == settings['f_rate']:
-                fan_value = key
-                break
-
-        if fan_value:
-            self.add_request(requests, path, fan_value)
-
-    def _handle_swing_setting(self, settings, requests):
-        """Handle swing-related settings."""
-        if (
-            'f_dir' not in settings
-            or self.values['mode'] not in self.API_PATHS["swing_settings"]
-        ):
+    def _handle_swing_setting(self, settings, requests, mode):
+        """Handle swing-related settings (case-insensitive on f_dir)."""
+        if 'f_dir' not in settings or mode not in self.API_PATHS["swing_settings"]:
             return
+
+        f_dir = str(settings['f_dir']).lower()
 
         # Set vertical swing
-        vertical_path = self.get_path("swing_settings", self.values['mode'], "vertical")
+        vertical_path = self.get_path("swing_settings", mode, "vertical")
         self.add_request(
             requests,
             vertical_path,
             (
                 self.TURN_OFF_SWING_AXIS
-                if settings['f_dir'] in ('off', 'horizontal')
+                if f_dir in ('off', 'horizontal')
                 else self.TURN_ON_SWING_AXIS
             ),
         )
 
         # Set horizontal swing
-        horizontal_path = self.get_path(
-            "swing_settings", self.values['mode'], "horizontal"
-        )
+        horizontal_path = self.get_path("swing_settings", mode, "horizontal")
         self.add_request(
             requests,
             horizontal_path,
             (
                 self.TURN_OFF_SWING_AXIS
-                if settings['f_dir'] in ('off', 'vertical')
+                if f_dir in ('off', 'vertical')
                 else self.TURN_ON_SWING_AXIS
             ),
         )
@@ -718,33 +707,45 @@ class DaikinBRP084(Appliance):
         # doesn't fetch current state before sending commands, so we can't
         # detect if the physical remote turned off the AC. Physical remote
         # override detection will rely on poll-based detection instead.
-        await self._update_settings(settings)
 
-        # Handle temperature setting with smart clipping if other settings exist
-        has_temp_setting = 'stemp' in settings
-        has_other_settings = any(key != 'stemp' for key in settings.keys())
+        # Normalize a COPY of the caller's settings (never mutate the input):
+        # lowercase the string dimensions, and accept the legacy 'heat' alias
+        # for this class's canonical 'hot' mode name.
+        settings = dict(settings)
+        for key in ('mode', 'f_rate', 'f_dir'):
+            value = settings.get(key)
+            if isinstance(value, str):
+                settings[key] = value.lower()
+        if settings.get('mode') == 'heat':
+            settings['mode'] = 'hot'
 
-        if has_temp_setting and not has_other_settings:
-            # Temperature-only setting - use smart clipping
-            requested_temp = float(settings['stemp'])
-            final_temp = await self._set_temperature_with_clipping(requested_temp)
-            if final_temp != requested_temp:
-                self._last_temp_adjustment = {
-                    'requested': requested_temp,
-                    'actual': final_temp,
-                    'message': f"Temperature adjusted from {requested_temp:.1f}°C to {final_temp:.1f}°C (nearest available)"
-                }
-                _LOGGER.info(self._last_temp_adjustment['message'])
-            else:
-                self._last_temp_adjustment = None
-            return {'detected_power_off': False, 'current_val': None}
+        # Mode used for path lookups: the new mode if changing (and not
+        # 'off'), else the current device mode.
+        if 'mode' in settings and settings['mode'] != 'off':
+            target_mode = settings['mode']
+        else:
+            target_mode = self.values.get('mode', invalidate=False)
 
-        # Handle other settings normally
         requests = []
+
+        # Auto power-on (BRP069 contract): operational settings sent while
+        # the unit is off power it on, using the last mode the device was
+        # actually seen running in ('auto' when it was never seen on).
+        if (
+            'mode' not in settings
+            and self.values.get('pow') == '0'
+            and any(k in settings for k in ('stemp', 'f_rate', 'f_dir'))
+        ):
+            target_mode = self.values.get('last_active_mode', 'auto')
+            self.add_request(requests, self.get_path("power"), "01")
+            _LOGGER.debug(
+                "Auto power-on: operational settings while off (mode %s)",
+                target_mode,
+            )
+
         self._handle_power_setting(settings, requests)
-        self._handle_temperature_setting(settings, requests)
-        self._handle_fan_setting(settings, requests)
-        self._handle_swing_setting(settings, requests)
+        self._handle_fan_setting(settings, requests, target_mode)
+        self._handle_swing_setting(settings, requests, target_mode)
 
         if requests:
             request_payload = DaikinRequest(requests).serialize()
@@ -755,26 +756,60 @@ class DaikinBRP084(Appliance):
             # Validate response status codes
             self._validate_response(response)
 
-            # Update status after setting
+        # Temperature goes through clipping in its OWN request, AFTER the
+        # power/mode multireq: a rejected temperature must never abort a
+        # power-on, and the device is already in the target mode when the
+        # new mode's temperature path is written.
+        temp_applied = False
+        if 'stemp' in settings:
+            if target_mode in self.API_PATHS["temp_settings"]:
+                requested_temp = float(settings['stemp'])
+                final_temp = await self._set_temperature_with_clipping(
+                    requested_temp, target_mode
+                )
+                temp_applied = True
+                if final_temp != requested_temp:
+                    self._last_temp_adjustment = {
+                        'requested': requested_temp,
+                        'actual': final_temp,
+                        'message': (
+                            f"Temperature adjusted from {requested_temp:.1f}°C "
+                            f"to {final_temp:.1f}°C (nearest available)"
+                        ),
+                    }
+                    _LOGGER.info(self._last_temp_adjustment['message'])
+                else:
+                    self._last_temp_adjustment = None
+            else:
+                _LOGGER.warning(
+                    "Ignoring stemp=%s: not supported in mode %r",
+                    settings['stemp'],
+                    target_mode,
+                )
+
+        if requests or temp_applied:
+            # Single trailing status refresh: device truth lands in
+            # self.values here — set() never mutates values optimistically.
             await self.update_status()
 
-            # v2.31.0: Power state verification - WARNING ONLY, do not raise.
-            # Per project guidance (CLAUDE.md): "DO NOT check expected_pow in pydaikin -
-            # Too many race conditions, use coordinator polling only".
-            # BRP072C/BRP084 devices may not reflect the new pow value in the post-set
-            # update_status() poll due to slow firmware processing. Raising here would
-            # propagate to climate.py:381, clear optimistic state, and cause cascading
-            # false-override events. Physical remote override detection happens via
-            # _handle_coordinator_update() which polls every 10s and reconciles.
-            if 'mode' in settings:
-                expected_pow = '0' if settings['mode'] == 'off' else '1'
-                actual_pow = self.values.get('pow')
-                if actual_pow != expected_pow:
-                    _LOGGER.warning(
-                        "Power state not yet reflected after set(): expected pow=%s, got pow=%s. "
-                        "Device may be slow to apply; coordinator poll will reconcile.",
-                        expected_pow, actual_pow
-                    )
+        # v2.31.0: Power state verification - WARNING ONLY, do not raise.
+        # Per project guidance (CLAUDE.md): "DO NOT check expected_pow in pydaikin -
+        # Too many race conditions, use coordinator polling only".
+        # BRP072C/BRP084 devices may not reflect the new pow value in the post-set
+        # update_status() poll due to slow firmware processing. Raising here would
+        # propagate to climate.py:381, clear optimistic state, and cause cascading
+        # false-override events. Physical remote override detection happens via
+        # _handle_coordinator_update() which polls every 10s and reconciles.
+        if 'mode' in settings:
+            expected_pow = '0' if settings['mode'] == 'off' else '1'
+            actual_pow = self.values.get('pow')
+            if actual_pow != expected_pow:
+                _LOGGER.warning(
+                    "Power state not yet reflected after set(): expected pow=%s, got pow=%s. "
+                    "Device may be slow to apply; coordinator poll will reconcile.",
+                    expected_pow,
+                    actual_pow,
+                )
 
         return {'detected_power_off': False, 'current_val': None}
 
@@ -819,29 +854,6 @@ class DaikinBRP084(Appliance):
             return self._last_temp_adjustment['message']
         return None
 
-    @property
-    def inside_temperature(self) -> Optional[float]:
-        """Return current indoor temperature (for compatibility with official HA integration)."""
-        try:
-            return float(self.values.get('htemp', 0))
-        except (ValueError, TypeError):
-            return None
-
-    @property
-    def target_temperature(self) -> Optional[float]:
-        """Return target temperature (for compatibility with official HA integration)."""
-        try:
-            return float(self.values.get('stemp', 0))
-        except (ValueError, TypeError):
-            return None
-
-    @property
-    def outside_temperature(self) -> Optional[float]:
-        """Return outdoor temperature (for compatibility with official HA integration)."""
-        try:
-            otemp = self.values.get('otemp', '--')
-            if otemp == '--':
-                return None
-            return float(otemp)
-        except (ValueError, TypeError):
-            return None
+    # inside_temperature / target_temperature / outside_temperature are
+    # inherited from Appliance (_parse_number): missing keys and '--'
+    # placeholders yield None (not a bogus 0.0), which HA maps to 'unknown'.

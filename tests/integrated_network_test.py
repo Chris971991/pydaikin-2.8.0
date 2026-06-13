@@ -8,11 +8,28 @@ from urllib.parse import unquote
 
 import pytest
 
-from pydaikin.discovery import get_devices
+from pydaikin.discovery import UDP_DST_PORT, get_devices
 from pydaikin.factory import DaikinFactory
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _advertised_http_port(device):
+    """Return the device-advertised HTTP port from a discovery entry, or None.
+
+    Discovery no longer overwrites 'port' with the UDP reply source port
+    (that now lives in 'udp_port'); an advertised port equal to the UDP
+    discovery port (30050) or 80 is not a usable custom HTTP port.
+    """
+    try:
+        port = int(device.get('port', ''))
+    except (TypeError, ValueError):
+        return None
+    if port in (80, UDP_DST_PORT):
+        return None
+    return port
+
 
 # Pre-defined device keys for convenience. Add as many as you would like here.
 DEVICE_KEYS = {
@@ -25,10 +42,10 @@ async def test_single_device(device_info):
     """Test a single device."""
     if isinstance(device_info, dict):
         ip_address = device_info['ip']
-        port = device_info.get('port')
+        port = _advertised_http_port(device_info)
         mac = device_info.get('mac', 'Unknown')
         name = device_info.get('name', 'Unknown')
-        device_id = f"{ip_address}:{port}" if port and port != 80 else ip_address
+        device_id = f"{ip_address}:{port}" if port else ip_address
         adp_kind = device_info.get('adp_kind', '')
     else:
         # Just an IP address string
@@ -43,9 +60,7 @@ async def test_single_device(device_info):
     if isinstance(name, str) and "%" in name:
         name = unquote(name)
 
-    print(
-        f"\n=== Testing device at {ip_address}{f':{port}' if port and port != 80 else ''} ==="
-    )
+    print(f"\n=== Testing device at {ip_address}{f':{port}' if port else ''} ===")
     print(f"Device Name: {name}")
     print(f"Device MAC: {mac}")
 
@@ -335,11 +350,8 @@ async def main():
     if discovered_devices:
         print(f"Discovered {len(discovered_devices)} Daikin devices:")
         for i, device in enumerate(discovered_devices, 1):
-            port_info = (
-                f":{device['port']}"
-                if 'port' in device and device['port'] != 80
-                else ""
-            )
+            http_port = _advertised_http_port(device)
+            port_info = f":{http_port}" if http_port else ""
             device_name = (
                 unquote(device.get('name', 'Unknown'))
                 if '%' in device.get('name', '')

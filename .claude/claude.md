@@ -17,7 +17,7 @@ This applies to ALL file copy operations, especially when deploying to Y: drive.
 
 ---
 
-## Physical Remote Override Detection System (v2.33.0)
+## Physical Remote Override Detection System (v2.40.0)
 
 ### Purpose
 When automation is controlling the AC and a user presses the **physical IR remote** to turn it OFF (or ON), the system detects this and activates **Override Mode** - pausing all automation for that room.
@@ -26,54 +26,58 @@ When automation is controlling the AC and a user presses the **physical IR remot
 
 **Key Principle:** `_last_known_pow` must ONLY reflect what the device has CONFIRMED, not what we asked it to do.
 
-1. **Automation sends ON command:**
-   - `_last_on_command_time` is set (for 30s protection window)
+1. **Automation sends a command:**
+   - `_last_any_command_time` is stamped BEFORE `device.set()` and re-stamped
+     by a done-callback when the (shielded) call actually completes — the 45s
+     grace is measured from completion, covering slow devices and BRP084
+     clipping retries
    - `_last_known_pow` is **NOT changed** (stays at previous confirmed value)
 
-2. **Device confirms ON:**
-   - Coordinator polls device, sees `pow=1`
-   - `_last_known_pow` is updated to `'1'`
+2. **Device confirms the new state:**
+   - Coordinator polls device, sees the new `pow`
+   - `_last_known_pow` is updated (coordinator is the ONLY writer)
 
-3. **User presses OFF on physical remote:**
+3. **User presses OFF on physical remote (>45s after the last command):**
    - Device turns off
    - Coordinator polls, sees `pow=0`
 
 4. **Override Detection fires:**
    - Sees: `_last_known_pow='1'` (confirmed ON) but `current_pow='0'` (now OFF)
-   - Check: Did we send ON recently? Yes, but device already confirmed ON
+   - No command inside the 45s grace, not in startup/reconnect grace
    - **Result: Override fires!** → `daikin_physical_remote_override` event
+
+A remote press WITHIN 45s of any command is silently synced (not detected);
+the blueprint's periodic_check is the documented safety net for that window.
 
 ### Critical Variables in `climate.py`
 
 | Variable | Purpose | Updated By |
 |----------|---------|------------|
 | `_last_known_pow` | Last CONFIRMED device power state | Coordinator ONLY |
-| `_last_on_command_time` | When we sent an ON command | `_set()` method |
-| `_last_off_command_time` | When we sent an OFF command | `_set()` method |
-| `_last_override_event_time` | Debounce duplicate events | Override detection |
+| `_last_any_command_time` | 45s any-command grace (mode-transition pow bounces) | Public handlers pre-call + set-completion callback |
+| `_last_active_hvac_mode` | Last coordinator-confirmed active mode (turn_on restore) | Coordinator ONLY |
+| `_last_override_event_time` | Debounce duplicate events (5s) | Override detection |
+| `_entity_init_timestamp` | 60s startup grace | `__init__` |
+| `_last_coordinator_recovery_time` | 60s reconnect grace (v2.36.0) | Coordinator transition |
+
+(v2.40.0 removed `_last_on_command_time`/`_last_off_command_time` and the
+v2.33.0 "device confirmed → fire anyway" arms: they were unreachable dead code —
+every path that armed the 30s windows also armed the 45s grace microseconds
+earlier, so the 45s branch always swallowed the poll first.)
 
 ### Protection Windows (Prevent False Positives)
 
-The 30-second protection window prevents false overrides when:
-- We send ON but device is slow to turn on
-- We send OFF but device is slow to turn off
-
-**Key insight:** Only skip detection if device hasn't confirmed our command yet.
-
-```python
-# Example: We sent ON, device is slow
-if _last_on_command_time < 30s ago:
-    if _last_known_pow == '0':  # Device hasn't confirmed ON yet
-        skip detection  # Might be slow device, not remote
-    else:  # _last_known_pow == '1', device confirmed ON
-        fire override!  # This is a REAL remote press
-```
+There is ONE command protection window: the **45s any-command grace**
+(`_last_any_command_time`). While a poll lands inside it, pow changes are
+silently synced into `_last_known_pow` without firing an override. The 60s
+startup grace and the 60s reconnect grace (v2.36.0) behave the same way.
 
 ### What NOT To Do
 
 1. **DO NOT set `_last_known_pow` in `_set()`** - This caused remote detection to never fire because it thought device already confirmed
-2. **DO NOT remove the 30s protection window** - Causes false overrides on slow devices
+2. **DO NOT remove the 45s any-command grace** - Causes false overrides during mode transitions (Daikin units bounce pow 1→0→1)
 3. **DO NOT check `expected_pow` in pydaikin** - Too many race conditions, use coordinator polling only
+4. **DO NOT re-add per-direction 30s ON/OFF windows** - They are strictly subsumed by the 45s grace (removed in v2.40.0 as unreachable)
 
 ### Blueprint Integration
 
@@ -86,14 +90,19 @@ The blueprint listens for `daikin_physical_remote_override` event and:
 
 1. Put room in Smart mode with presence
 2. Wait for automation to turn AC ON
-3. Wait ~15 seconds for device to confirm ON (check logs)
+3. Wait **>45 seconds after the LAST automation command** (the 45s grace
+   silently syncs earlier presses — check logs for command activity; on
+   high-trigger setups temporarily pause the automation to get a quiet window)
 4. Press OFF on physical remote
 5. Override should fire within 10 seconds (next coordinator poll)
 
 ### v2.37.0 Mode-Transition Grace Tradeoff
 
-The 45s grace at `climate.py:605` (`_last_any_command_time`) suppresses ALL override
-detection for 45 seconds after ANY automation command.
+The 45s grace (`_last_any_command_time`, the `< 45` check in
+`_handle_coordinator_update`) suppresses ALL override detection for 45 seconds
+after ANY automation command — and since v2.40.0 the timestamp is re-stamped
+when `device.set()` completes, so the effective suppression is
+45s-from-completion.
 
 **Intentional:** Daikin units bounce `pow 1→0→1` during mode transitions
 (e.g., `cool→fan_only`). Without this grace, every transition would fire a false override.
@@ -107,9 +116,11 @@ detected as overrides immediately. They will be picked up via:
 triggers/day) keep this grace continuously active. By design — periodic_check
 is the safety net.
 
-**If you need to tune:** constant is at `climate.py` line 605 (`< 45`). Decreasing
-risks false overrides during mode transitions; increasing further may starve
-real-remote detection.
+**If you need to tune:** search climate.py for the `< 45` check in
+`_handle_coordinator_update`. Decreasing risks false overrides during mode
+transitions; increasing further may starve real-remote detection. The blueprint
+override windows (50s as of v9.9.0) must stay >= this constant — change them
+together.
 
 ### v2.31.0 Post-Set Verification Removed (BRP084)
 

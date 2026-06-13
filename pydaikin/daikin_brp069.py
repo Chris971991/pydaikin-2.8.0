@@ -1,9 +1,11 @@
 """Pydaikin appliance, represent a Daikin BRP069 device."""
 
+import asyncio
 from datetime import datetime, timezone
 import logging
 
 from .daikin_base import Appliance
+from .exceptions import DaikinException
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -142,12 +144,24 @@ class DaikinBRP069(Appliance):
 
     async def init(self):
         """Init status."""
-        # Only fetch essential info during init for faster startup
-        # The coordinator will fetch full status afterwards
+        # Fetch the essential state plus the one-shot resources that gate
+        # feature support: common/get_holiday provides 'en_hol'
+        # (support_away_mode) and aircon/get_week_power + aircon/get_year_power
+        # provide 'datas' / 'this_year' / 'previous_year'
+        # (support_energy_consumption). Without these the support flags can
+        # never flip True and energy monitoring / away mode stay dead.
+        # Still a slimmed init: 6 lightweight GETs (serialized via
+        # MAX_CONCURRENT_REQUESTS=1) instead of upstream's 13; the
+        # coordinator fetches full status afterwards. Units lacking an
+        # endpoint return 404 -> {} or ret != OK (skipped by update_status),
+        # so unsupported units keep the flags False without erroring.
         essential_resources = [
             'common/basic_info',
             'aircon/get_sensor_info',
             'aircon/get_control_info',
+            'common/get_holiday',
+            'aircon/get_week_power',
+            'aircon/get_year_power',
         ]
         await self.update_status(essential_resources)
 
@@ -163,16 +177,26 @@ class DaikinBRP069(Appliance):
 
     async def _update_settings(self, settings):
         """Update settings to set on Daikin device."""
-        device_ip = getattr(self, 'device_ip', None) or getattr(self, '_device_ip', 'unknown')
+        device_ip = getattr(self, 'device_ip', None) or getattr(
+            self, '_device_ip', 'unknown'
+        )
         _LOGGER.debug("_update_settings START [%s]: settings=%s", device_ip, settings)
 
         # start with current values
         resource = 'aircon/get_control_info'
         _LOGGER.debug("_update_settings [%s]: Fetching current state...", device_ip)
         current_val = await self._get_resource(resource)
+        # Guard against rejected ({'ret': ...}) or invalid/empty responses:
+        # merging them would poison self.values and the 'off' branch below
+        # would KeyError on current_val['mode'].
+        if not current_val or 'mode' not in current_val:
+            raise DaikinException(
+                f"get_control_info returned invalid/rejected response: {current_val}"
+            )
         _LOGGER.debug(
             "_update_settings FETCHED [%s]: current_val.pow=%s",
-            device_ip, current_val.get('pow')
+            device_ip,
+            current_val.get('pow'),
         )
 
         # Merge current_val with mapped settings
@@ -183,7 +207,10 @@ class DaikinBRP069(Appliance):
 
         _LOGGER.debug(
             "_update_settings AFTER MERGE [%s]: self.values.pow=%s, 'mode' in settings=%s, settings.get('mode')=%s",
-            device_ip, self.values.get('pow'), 'mode' in settings, settings.get('mode')
+            device_ip,
+            self.values.get('pow'),
+            'mode' in settings,
+            settings.get('mode'),
         )
 
         # we are using an extra mode "off" to power off the unit
@@ -197,7 +224,9 @@ class DaikinBRP069(Appliance):
         # powered on OR if the request is empty power on
         elif 'mode' in settings or not settings:
             self.values['pow'] = '1'
-            _LOGGER.debug("_update_settings [%s]: MODE IN SETTINGS OR EMPTY -> pow=1", device_ip)
+            _LOGGER.debug(
+                "_update_settings [%s]: MODE IN SETTINGS OR EMPTY -> pow=1", device_ip
+            )
 
         # FIX: If changing temperature, fan, or swing while device is off and mode is
         # not being changed to 'off', we need to power on the device.
@@ -210,10 +239,15 @@ class DaikinBRP069(Appliance):
                 self.values['pow'] = '1'
                 _LOGGER.debug(
                     "_update_settings [%s]: AUTO-POWER-ON: settings=%s contained operational params -> pow=1",
-                    device_ip, list(settings.keys())
+                    device_ip,
+                    list(settings.keys()),
                 )
 
-        _LOGGER.debug("_update_settings EXIT [%s]: final pow=%s", device_ip, self.values.get('pow'))
+        _LOGGER.debug(
+            "_update_settings EXIT [%s]: final pow=%s",
+            device_ip,
+            self.values.get('pow'),
+        )
 
         # Use settings for respecitve mode (dh and dt)
         for k, val in {'stemp': 'dt', 'shum': 'dh', 'f_rate': 'dfr'}.items():
@@ -233,14 +267,28 @@ class DaikinBRP069(Appliance):
                          Used by climate.py to detect physical remote override.
 
         Returns:
-            dict with 'detected_power_off' (bool), 'current_val' (dict), and optionally 'aborted' (bool)
+            dict with 'detected_power_off' (bool), 'detected_power_on' (bool),
+            'current_val' (dict) and 'aborted' (bool) — the same shape on every
+            return path (normal and both abort branches).
         """
-        device_ip = getattr(self, 'device_ip', None) or getattr(self, '_device_ip', 'unknown')
-        _LOGGER.debug("set() ENTRY [%s]: settings=%s, expected_pow=%s", device_ip, settings, expected_pow)
+        device_ip = getattr(self, 'device_ip', None) or getattr(
+            self, '_device_ip', 'unknown'
+        )
+        _LOGGER.debug(
+            "set() ENTRY [%s]: settings=%s, expected_pow=%s",
+            device_ip,
+            settings,
+            expected_pow,
+        )
         try:
             current_val = await self._update_settings(settings)
         except Exception as e:
-            _LOGGER.error("set() FAILED [%s]: _update_settings raised %s: %s", device_ip, type(e).__name__, e)
+            _LOGGER.error(
+                "set() FAILED [%s]: _update_settings raised %s: %s",
+                device_ip,
+                type(e).__name__,
+                e,
+            )
             raise
 
         # Detect if device was OFF when we're trying to turn it ON
@@ -255,12 +303,17 @@ class DaikinBRP069(Appliance):
             _LOGGER.warning(
                 "set() PHYSICAL REMOTE OVERRIDE [%s]: Expected pow=1 but device reports pow=0. "
                 "ABORTING command - user turned off AC via physical remote.",
-                device_ip
+                device_ip,
             )
+            # Un-pollute self.values: _update_settings merged the requested
+            # settings before the abort decision; re-apply device truth so
+            # values don't claim a state that was never sent.
+            self.values.update_by_resource('aircon/get_control_info', current_val)
             return {
                 'detected_power_off': True,
+                'detected_power_on': False,
                 'current_val': current_val,
-                'aborted': True  # Signal that command was NOT sent
+                'aborted': True,  # Signal that command was NOT sent
             }
 
         # Physical remote turn-ON detection (symmetric to turn-OFF):
@@ -271,12 +324,15 @@ class DaikinBRP069(Appliance):
             _LOGGER.warning(
                 "set() PHYSICAL REMOTE TURN-ON [%s]: Expected pow=0 but device reports pow=1. "
                 "ABORTING command - user turned ON AC via physical remote.",
-                device_ip
+                device_ip,
             )
+            # Un-pollute self.values (see turn-OFF abort branch above).
+            self.values.update_by_resource('aircon/get_control_info', current_val)
             return {
+                'detected_power_off': False,
                 'detected_power_on': True,
                 'current_val': current_val,
-                'aborted': True  # Signal that command was NOT sent
+                'aborted': True,  # Signal that command was NOT sent
             }
 
         path = 'aircon/set_control_info'
@@ -300,55 +356,115 @@ class DaikinBRP069(Appliance):
                 params.update({"f_dir": self.values['f_dir']})
 
         _LOGGER.debug("Sending request to %s with params: %s", path, params)
-        await self._get_resource(path, params)
+        response = await self._get_resource(path, params)
+        if 'ret' in response:
+            # parse_response preserves {'ret': <value>} when the device
+            # rejects a request — surface it instead of silently 'succeeding'.
+            raise DaikinException(
+                f"Device rejected set_control_info (ret={response['ret']}); "
+                f"params={params}"
+            )
 
-        # Update status after setting to get the latest device state
-        await self.update_status()
+        # Update status after setting to get the latest device state.
+        # A refresh-only failure must NOT fail the command: set_control_info
+        # already succeeded and the coordinator's next poll reconciles state
+        # (same principle as the v2.31.0 BRP084 warning-only post-set check).
+        try:
+            await self.update_status()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.warning(
+                "post-set status refresh failed; coordinator poll will reconcile"
+            )
 
         return {
             'detected_power_off': detected_power_off,
-            'current_val': current_val
+            'detected_power_on': False,
+            'current_val': current_val,
+            'aborted': False,
         }
 
     async def set_holiday(self, mode):
-        """Set holiday mode."""
+        """Set holiday mode.
+
+        Raises ValueError on unmapped input (caller error) and
+        DaikinException when the device rejects the command; self.values
+        is mutated only after the device accepted the command.
+        """
         value = self.human_to_daikin('en_hol', mode)
-        if value in ('0', '1'):
-            self.values["en_hol"] = value
+        if value not in ('0', '1'):
+            raise ValueError(f"Invalid holiday mode {mode!r}")
 
-            path = 'common/set_holiday'
-            params = {"en_hol": value}
+        path = 'common/set_holiday'
+        params = {"en_hol": value}
 
-            _LOGGER.debug("Sending request to %s with params: %s", path, params)
-            await self._get_resource(path, params)
+        _LOGGER.debug("Sending request to %s with params: %s", path, params)
+        response = await self._get_resource(path, params)
+        if 'ret' in response:
+            raise DaikinException(
+                f"Device rejected set_holiday (ret={response['ret']}); "
+                f"params={params}"
+            )
+        # Mutate state only after the device accepted the command
+        self.values['en_hol'] = value
 
     async def set_advanced_mode(self, mode, value):
-        """Enable or disable advanced modes."""
-        mode = self.human_to_daikin('spmode_kind', mode)
-        value = self.human_to_daikin('spmode', value)
-        if value in ('0', '1'):
-            path = 'aircon/set_special_mode'
-            params = {
-                "spmode_kind": mode,
-                "set_spmode": value,
-            }
+        """Enable or disable advanced modes.
 
-            _LOGGER.debug("Sending request to %s with params: %s", path, params)
-            # Update the adv value from the response
-            self.values.update(await self._get_resource(path, params))
+        Raises ValueError on unmapped input (caller error) and
+        DaikinException when the device rejects the command.
+        """
+        original_mode, original_value = mode, value
+        mode = self.human_to_daikin('spmode_kind', mode)
+        if mode not in ('0', '1', '2'):
+            raise ValueError(f"Invalid advanced mode kind {original_mode!r}")
+        value = self.human_to_daikin('spmode', value)
+        if value not in ('0', '1'):
+            raise ValueError(f"Invalid advanced mode value {original_value!r}")
+
+        path = 'aircon/set_special_mode'
+        params = {
+            "spmode_kind": mode,
+            "set_spmode": value,
+        }
+
+        _LOGGER.debug("Sending request to %s with params: %s", path, params)
+        response = await self._get_resource(path, params)
+        if 'ret' in response:
+            # Check the rejection marker BEFORE merging, otherwise
+            # {'ret': ...} would pollute self.values.
+            raise DaikinException(
+                f"Device rejected set_special_mode (ret={response['ret']}); "
+                f"params={params}"
+            )
+        # Update the adv value from the response
+        self.values.update(response)
 
     async def set_streamer(self, mode):
-        """Enable or disable the streamer."""
-        value = self.human_to_daikin('en_streamer', mode)
-        if value in ('0', '1'):
-            path = 'aircon/set_special_mode'
-            params = {
-                "en_streamer": value,
-            }
+        """Enable or disable the streamer.
 
-            _LOGGER.debug("Sending request to %s with params: %s", path, params)
-            # Update the adv value from the response
-            self.values.update(await self._get_resource(path, params))
+        Raises ValueError on unmapped input (caller error) and
+        DaikinException when the device rejects the command.
+        """
+        value = self.human_to_daikin('en_streamer', mode)
+        if value not in ('0', '1'):
+            raise ValueError(f"Invalid streamer mode {mode!r}")
+
+        path = 'aircon/set_special_mode'
+        params = {
+            "en_streamer": value,
+        }
+
+        _LOGGER.debug("Sending request to %s with params: %s", path, params)
+        response = await self._get_resource(path, params)
+        if 'ret' in response:
+            raise DaikinException(
+                f"Device rejected set_special_mode (ret={response['ret']}); "
+                f"params={params}"
+            )
+        # Update the adv value from the response
+        self.values.update(response)
 
     async def set_zone(self, zone_id, key, value):
         """Set zone status."""
