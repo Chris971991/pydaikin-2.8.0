@@ -395,11 +395,13 @@ cp "C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_clima
 
 1. **Bump version** in `pyproject.toml` (e.g., 2.24.0 → 2.25.0)
 2. **Commit and push** to GitHub
-3. **Create git tag** matching the version (e.g., `git tag v2.25.0 && git push --tags`)
-4. **Update manifest.json** in both repos to reference new commit hash and version
-5. **Copy manifest.json and climate.py** to Y: drive
+3. **Create git tag** matching the version (e.g., `git tag v2.25.0 && git push --tags`) — the tag push triggers the GitHub release workflow, which verifies the tag matches the pyproject version, builds, and publishes the release automatically
+4. **Update manifest.json** in both repos to reference new commit hash and version. Bump the manifest version in the SAME commit that changes the requirements git hash so the installed integration version always identifies which pydaikin pin it expects. Note: HA/pip CANNOT detect a changed git hash for an already-installed pydaikin at any version — the manual `ha core stop && pip uninstall pydaikin -y && pip install git+...@<hash> && ha core start` step is always mandatory.
+5. **Copy manifest.json and climate.py** (and any other changed integration files) to Y: drive
 6. **SSH into HA and reinstall pydaikin** (see commands below)
 7. **Restart HA** to pick up the new pydaikin
+
+**Versioning scheme (since 2.40.0):** pydaikin and the HA integration release with ALIGNED version numbers — one number per deployment event, incremented together even when one repo's change is trivial. (Before 2.40.0 the two streams interleaved confusingly: 'v2.31.0' was a pydaikin event while 'v2.36.0/v2.37.0' were climate.py events.)
 
 ```bash
 # Example release workflow
