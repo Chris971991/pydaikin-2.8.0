@@ -338,16 +338,16 @@ Both repositories may need PRs to their upstream projects:
 
 The Daikin integration works in conjunction with the **Ultimate Climate Control Blueprint**:
 
-- **Blueprint Location**: `C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml`
+- **Blueprint Location**: `C:\Users\Chris\Documents\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml`
 - **Repository**: https://github.com/Chris971991/Smart-Climate-Control
 
-### Current Feature: Physical Remote Override Detection (v6.2.0)
+### Current Feature: Physical Remote Override Detection (blueprint v9.10.0 / integration v2.40.0)
 
-The integration and blueprint work together to detect when a user turns off the AC using the physical remote while automation is running:
+The integration and blueprint work together to detect when a user turns off the AC using the physical remote while automation is running. Detection is **coordinator-poll driven**, not `detected_power_off`-flag driven:
 
-1. **pydaikin** (`daikin_brp069.py`): The `set()` method returns `detected_power_off: True` when device reports `pow=0` but we're trying to set `pow=1`
-2. **climate.py**: Checks this flag and fires `daikin_physical_remote_override` HA event
-3. **Blueprint**: Listens for this event and immediately activates Override mode
+1. **pydaikin** still returns `detected_power_off` from `set()` for API compatibility, but climate.py no longer reads it (too many race conditions — see "What NOT To Do" #3).
+2. **climate.py**: `_handle_coordinator_update` compares the coordinator-confirmed `_last_known_pow` against the freshly-polled `pow`; on a mismatch outside the 45s/60s grace windows it fires the `daikin_physical_remote_override` HA event.
+3. **Blueprint** (v9.9.0+): listens for the event and activates Override mode. Its own periodic_check + climate_state_change override detection uses a single 50s `override_command_grace` constant (>= the integration's 45s grace) so mid-transition pow bounces don't fire a false override the integration is deliberately suppressing.
 
 ### CRITICAL: Deployment Workflow
 
@@ -357,11 +357,11 @@ The integration and blueprint work together to detect when a user turns off the 
 # 1. Edit in local repos
 # - pydaikin: C:\Users\Chris\Documents\pydaikin-2.8.0\pydaikin\*.py
 # - climate.py: C:\Users\Chris\Documents\homeassistant-daikin-optimized\custom_components\daikin\climate.py
-# - blueprint: C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml
+# - blueprint: C:\Users\Chris\Documents\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml
 
 # 2. Copy to Y: drive (HA's config folder mounted as network share)
 cp "C:\Users\Chris\Documents\homeassistant-daikin-optimized\custom_components\daikin\climate.py" "Y:\custom_components\daikin\climate.py"
-cp "C:\Users\Chris\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml" "Y:\blueprints\automation\Chris971991\ultimate_climate_control.yaml"
+cp "C:\Users\Chris\Documents\Smart-Climate-Control-V5\Smart-Climate-Control\ultimate_climate_control.yaml" "Y:\blueprints\automation\Chris971991\ultimate_climate_control.yaml"
 
 # 3. Restart HA to pick up changes
 ```
@@ -481,8 +481,29 @@ DEFAULT_UPDATE_INTERVAL = 15  # Reduces request pile-ups on slow devices
 
 **Trade-off:** Physical remote detection takes 15s instead of 10s.
 
-### Current Settings (v2.28.0)
+### Current Settings (v2.40.0)
 - BRP084 HTTP timeout: 20s (increased from 15s)
 - BRP069 HTTP timeout: 20s (base class default)
 - Polling interval: 10s
-- MAX_CONCURRENT_REQUESTS: 4
+- MAX_CONCURRENT_REQUESTS: 4 (BRP069/072C override to 1 — slow units corrupt under concurrent requests)
+- Coordinator overall poll timeout: 90s (`COORDINATOR_UPDATE_TIMEOUT` in const.py — sized for 6 serialized resources on a slow BRP072C)
+- In-call retry: polls use `attempts=1` (the 10s coordinator cadence IS the retry); commands use `attempts=2` (tenacity replaced by a bounded manual loop in v2.40.0)
+
+### Deploy Log
+
+Append a row after every deploy (date | pydaikin hash+ver | integration ver | blueprint ver).
+
+| Date | pydaikin | integration | blueprint | Notes |
+|------|----------|-------------|-----------|-------|
+| pre-2026-06 | 99f250c / 2.31.0 | 2.36.0 | 9.8.0 | baseline before the 2026-06 audit-fix program |
+| 2026-06-13 | 01bd5ef / 2.40.0 | 2.40.0 | 9.10.0 | audit-fix program: command correctness, polling integrity, override-system fixes, blueprint override-correctness + 5 dead features wired up |
+
+### Running tests (pydaikin)
+
+```bash
+cd C:\Users\Chris\Documents\pydaikin-2.8.0
+py -3.13 -m venv .venv
+.venv\Scripts\python -m pip install -e . -r requirements-test.txt
+.venv\Scripts\python -m pytest tests        # async tests now run (asyncio_mode=auto)
+```
+Note: `netifaces` has no cp313 wheel and compiles from source (MSVC required, present on this machine).
