@@ -54,6 +54,12 @@ exclude = '''
 )/
 '''
 
+[tool.pylint."messages control"]
+# R0801 duplicate-code: the set_control_info ret-check blocks in
+# daikin_airbase / daikin_brp069 are intentionally parallel per-protocol
+# code; extracting a shared helper is not worth the behavior risk.
+disable = ["duplicate-code"]
+
 [tool.pytype]
 python_version = 3.11
 

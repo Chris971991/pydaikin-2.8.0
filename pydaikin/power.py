@@ -172,7 +172,8 @@ class DaikinPowerMixin:
         if curr.yesterday is None:
             _LOGGER.error(
                 'Decreasing today state and missing yesterday state caused an '
-                'impossible energy consumption measure of %s on device %s (curr.today=%s, prev.today=%s)',
+                'impossible energy consumption measure of %s on device %s '
+                '(curr.today=%s, prev.today=%s)',
                 mode,
                 getattr(self, 'device_ip', 'unknown'),
                 curr.today,

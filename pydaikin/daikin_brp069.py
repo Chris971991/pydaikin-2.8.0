@@ -206,7 +206,8 @@ class DaikinBRP069(Appliance):
         )
 
         _LOGGER.debug(
-            "_update_settings AFTER MERGE [%s]: self.values.pow=%s, 'mode' in settings=%s, settings.get('mode')=%s",
+            "_update_settings AFTER MERGE [%s]: self.values.pow=%s, "
+            "'mode' in settings=%s, settings.get('mode')=%s",
             device_ip,
             self.values.get('pow'),
             'mode' in settings,
@@ -238,7 +239,8 @@ class DaikinBRP069(Appliance):
             if any(k in settings for k in operational_settings):
                 self.values['pow'] = '1'
                 _LOGGER.debug(
-                    "_update_settings [%s]: AUTO-POWER-ON: settings=%s contained operational params -> pow=1",
+                    "_update_settings [%s]: AUTO-POWER-ON: settings=%s "
+                    "contained operational params -> pow=1",
                     device_ip,
                     list(settings.keys()),
                 )
@@ -371,7 +373,9 @@ class DaikinBRP069(Appliance):
         # (same principle as the v2.31.0 BRP084 warning-only post-set check).
         try:
             await self.update_status()
-        except asyncio.CancelledError:
+        # Immediate re-raise is intentional: CancelledError must propagate
+        # and not be swallowed by the broad Exception handler below.
+        except asyncio.CancelledError:  # pylint: disable=try-except-raise
             raise
         except Exception:  # pylint: disable=broad-except
             _LOGGER.warning(

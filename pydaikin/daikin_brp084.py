@@ -308,6 +308,7 @@ class DaikinBRP084(Appliance):
         await self.update_status()
 
     async def update_status(self, resources=None):
+        # pylint: disable=too-many-branches,too-many-statements
         """Update device status."""
         payload = {
             "requests": [
@@ -361,13 +362,17 @@ class DaikinBRP084(Appliance):
                         'ascii', errors='ignore'
                     )
                     _LOGGER.info(
-                        f"Extracted model: {self.values['model']} from hex: {model_hex}"
+                        "Extracted model: %s from hex: %s",
+                        self.values['model'],
+                        model_hex,
                     )
                 else:
                     self.values['model'] = None
                     _LOGGER.warning("Model hex was empty or None")
-            except Exception as e:
-                _LOGGER.error(f"Could not parse model number: {e}")
+            # Graceful degradation: model is informational only, any parse
+            # failure must not abort the status update.
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Could not parse model number: %s", e)
                 self.values['model'] = None
 
             # Get power state
@@ -405,8 +410,10 @@ class DaikinBRP084(Appliance):
                     )
                 else:
                     self.values['otemp'] = "--"
-            except Exception as e:
-                _LOGGER.error(f"Error parsing outdoor temperature: {e}")
+            # Graceful degradation: fall back to the "--" placeholder, any
+            # parse failure must not abort the status update.
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Error parsing outdoor temperature: %s", e)
                 self.values['otemp'] = "--"
 
             self.values['htemp'] = str(
@@ -549,14 +556,15 @@ class DaikinBRP084(Appliance):
 
             if rsc in (2000, 2004):
                 continue  # Success codes
-            elif rsc == 4000:
+
+            if rsc == 4000:
                 fr = resp.get('fr', 'unknown')
                 raise DaikinRejectedValueError(
                     f"Device rejected request to {fr} (error code: {rsc})"
                 )
-            else:
-                fr = resp.get('fr', 'unknown')
-                raise DaikinException(f"Device error for {fr}: code {rsc}")
+
+            fr = resp.get('fr', 'unknown')
+            raise DaikinException(f"Device error for {fr}: code {rsc}")
 
     async def _set_temperature_with_clipping(
         self, target_temp: float, mode: str
@@ -691,6 +699,7 @@ class DaikinBRP084(Appliance):
         )
 
     async def set(self, settings, expected_pow=None):
+        # pylint: disable=too-many-branches
         """Set settings on Daikin device.
 
         Args:

@@ -47,7 +47,8 @@ def _redact(params: dict, headers: dict) -> tuple:
     return redacted_params, redacted_headers
 
 
-class Appliance(DaikinPowerMixin):  # pylint: disable=too-many-public-methods
+class Appliance(DaikinPowerMixin):
+    # pylint: disable=too-many-public-methods,too-many-instance-attributes
     """Daikin main appliance class."""
 
     base_url: str

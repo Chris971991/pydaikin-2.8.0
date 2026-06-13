@@ -50,6 +50,7 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
         key: str = None,
         **kwargs,
     ) -> None:
+        # pylint: disable=too-many-branches,too-many-statements
         """Factory to init the corresponding Daikin class."""
 
         # Resolve IP literals / explicit ports synchronously; only fall back
@@ -151,7 +152,7 @@ class DaikinFactory:  # pylint: disable=too-few-public-methods
                             f"Device at {device_ip} is not responding. "
                             "The device may be offline or unreachable. "
                             "Please check the device network connection and try again."
-                        )
+                        ) from err
                 except _PROBE_EXCEPTIONS as airbase_err:
                     # All device types failed - device is likely offline
                     await self._generated_object.close()

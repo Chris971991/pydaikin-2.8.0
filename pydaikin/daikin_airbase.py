@@ -184,7 +184,8 @@ class DaikinAirBase(DaikinBRP069):
 
         if detected_power_off:
             _LOGGER.warning(
-                "set() DETECTED_POWER_OFF [AirBase]: Device reported pow=0 but we're setting pow=1. "
+                "set() DETECTED_POWER_OFF [AirBase]: Device reported pow=0 "
+                "but we're setting pow=1. "
                 "Someone may have turned off AC via physical remote."
             )
 

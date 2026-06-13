@@ -141,7 +141,8 @@ class DaikinSkyFi(Appliance):
         Args:
             settings: dict of settings to apply
             expected_pow: If provided ('0' or '1'), used for physical remote override detection.
-                         Currently not used for abort logic in SkyFi, but included for API compatibility.
+                         Currently not used for abort logic in SkyFi, but
+                         included for API compatibility.
 
         Returns:
             dict with 'detected_power_off' (bool) and 'current_val' (dict)
@@ -184,7 +185,8 @@ class DaikinSkyFi(Appliance):
 
         if detected_power_off:
             _LOGGER.warning(
-                "set() DETECTED_POWER_OFF [SkyFi]: Device reported opmode=0 but we're setting opmode=1. "
+                "set() DETECTED_POWER_OFF [SkyFi]: Device reported opmode=0 "
+                "but we're setting opmode=1. "
                 "Someone may have turned off AC via physical remote."
             )
 
