@@ -3,6 +3,10 @@ on:
   push:
     tags:
       - 'v*'
+  # Fallback: fork event-triggers may be gated until workflows are enabled
+  # in the web UI Actions tab — dispatch with the tag as ref:
+  #   gh workflow run release.yml --ref vX.Y.Z
+  workflow_dispatch:
 
 jobs:
   build:
