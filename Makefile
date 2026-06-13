@@ -1,20 +1,16 @@
-ifndef version
-	version = patch
-endif
-
-.PHONY: default format white black lint test check clean pypireg pypi release
+.PHONY: default format white black lint test check clean pypi
 
 default: check
 
 format: white
-	isort setup.py bin/pydaikin pydaikin/*.py
+	isort bin/pydaikin pydaikin/*.py tests/*.py
 
 white: black
 
 black:
 	black . pydaikin
 
-lint: requirements.txt setup.py
+lint:
 	flake8
 
 check: format lint
@@ -27,13 +23,10 @@ clean:
 	rm -f pip-selfcheck.json
 	rm -rf pytype_output
 
-pypireg:
-	python setup.py register -r pypi
-
+# Manual fallback only — the tag-triggered GitHub workflow builds and publishes
+# releases. Release flow: bump pyproject.toml version -> commit -> git tag vX.Y.Z
+# -> git push && git push --tags (see .claude/CLAUDE.md "Releasing pydaikin Updates").
 pypi:
-	rm -f dist/*.tar.gz
-	python3 setup.py sdist
-	twine upload dist/*.tar.gz
-
-release:
-	git diff-index --quiet HEAD -- && make check && bumpversion $(version) && git push --tags && git push && make pypi
+	rm -f dist/*
+	python3 -m build
+	twine upload dist/*
