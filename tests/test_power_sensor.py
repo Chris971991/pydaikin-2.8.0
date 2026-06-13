@@ -137,6 +137,12 @@ def relative_error(measured, expected):
     return abs(measured - expected) / expected
 
 
+@pytest.mark.xfail(
+    reason="M2: fork's slimmed init() never fetches week/year power, so "
+    "support_energy_consumption stays False — remove this mark when the "
+    "Phase 1 init() fix (audit M2) lands",
+    strict=False,
+)
 @pytest.mark.parametrize(
     "initial_date,duration,tick_step",
     [

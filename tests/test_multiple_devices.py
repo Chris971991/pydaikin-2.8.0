@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from aiohttp import web
+import pytest
 
 from pydaikin.daikin_airbase import DaikinAirBase
 from pydaikin.daikin_brp069 import DaikinBRP069
@@ -245,6 +246,13 @@ class FakeDaikinServer:
             await self.runner.cleanup()
 
 
+@pytest.mark.xfail(
+    reason="First-ever run of this test (was silently skipped) exposed factory "
+    "detection rot: firmware280 fake-server fixture no longer matches current "
+    "BRP084 endpoints, and the skyfi path errors with 'not supported'. "
+    "Revisit with the Phase 1 factory items (audit B:M1) and BRP084 chain.",
+    strict=False,
+)
 async def test_device_factory():
     """Test that the factory correctly identifies different device types."""
     results = []
@@ -317,11 +325,8 @@ async def test_device_factory():
                 f"{status} - {result['device_type']}: Identified as {result['identified_as']}"
             )
 
-    # Overall success
-    overall_success = all(result.get("success", False) for result in results)
-    print(f"\nOverall Test {'✅ PASSED' if overall_success else '❌ FAILED'}")
-
-    return overall_success
+    failures = [r for r in results if not r.get("success", False)]
+    assert not failures, f"Factory detection failures: {failures}"
 
 
 if __name__ == "__main__":

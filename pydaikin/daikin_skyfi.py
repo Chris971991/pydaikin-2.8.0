@@ -188,7 +188,9 @@ class DaikinSkyFi(Appliance):
 
         return {
             'detected_power_off': detected_power_off,
-            'current_val': self.values.copy()
+            # dict() rather than .copy(): ApplianceValues is a MutableMapping
+            # without a copy() method
+            'current_val': dict(self.values),
         }
 
     @property

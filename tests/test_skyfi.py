@@ -52,10 +52,15 @@ async def test_daikinSkiFi(aresponses, client_session):
         response="opmode=1&units=.&settemp=20.0&fanspeed=3&fanflags=1&acmode=8&tonact=0&toffact=0&prog=0&time=23:36&day=6&roomtemp=23&outsidetemp=0&louvre=1&zone=0&flt=0&test=0&errdata=146&sensors=1",
     )
 
-    await device.set({"mode": "cool"})
+    result = await device.set({"mode": "cool"})
     aresponses.assert_all_requests_matched()
     assert device.represent("mode") == ('mode', 'cool')
     assert device.target_temperature == 20.0
+    # set() return contract (H4): plain-dict snapshot + power-off detection
+    # (the ac.cgi mock reports opmode=0 while we turn ON, so detection fires)
+    assert isinstance(result['current_val'], dict)
+    assert result['detected_power_off'] is True
+    assert result['current_val'].get('opmode') == '1'
 
     aresponses.add(
         path_pattern="/ac.cgi",
