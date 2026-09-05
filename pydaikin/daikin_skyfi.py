@@ -6,7 +6,7 @@ from urllib.parse import unquote
 
 from aiohttp import ClientSession
 
-from .daikin_base import Appliance
+from .daikin_base import RETRYABLE_EXCEPTIONS, Appliance
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -114,14 +114,21 @@ class DaikinSkyFi(Appliance):
         return response
 
     async def _get_resource(
-        self, path: str, params: dict | None = None, *, attempts: int = 2
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        attempts: int = 2,
+        retry_on: tuple = RETRYABLE_EXCEPTIONS,
     ):
         """Make the http request."""
         if params is None:
             params = {}
         # ensure password is the first parameter
         params = {**{"pass": self._password}, **params}
-        ret = await super()._get_resource(path, params, attempts=attempts)
+        ret = await super()._get_resource(
+            path, params, attempts=attempts, retry_on=retry_on
+        )
         await sleep(0.3)
         return ret
 

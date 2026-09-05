@@ -122,6 +122,22 @@ class DaikinBRP069(Appliance):
 
     MAX_CONCURRENT_REQUESTS = 1
 
+    # v2.42.0: the BRP069/072C embedded web server drops idle keep-alive
+    # sockets. A pooled connection reused from Home Assistant's shared session
+    # then fails instantly with ServerDisconnectedError: 23 failed polls in one
+    # night on a BRP072C, 20 of them a single resource while the rest of the
+    # same poll succeeded (05/06-09-2026). Closing after every request costs
+    # one TCP (plus TLS on BRP072C) handshake per call and removes the class.
+    EXTRA_REQUEST_HEADERS = {'Connection': 'close'}
+
+    # Energy statistics change hourly on the unit; polling both endpoints
+    # every 10s was half the request load on a slow unit and produced 15 of
+    # those 23 failures. Once a minute keeps the energy sensors current.
+    RESOURCE_MIN_INTERVAL = {
+        'aircon/get_day_power_ex': 60,
+        'aircon/get_week_power': 60,
+    }
+
     @staticmethod
     def parse_response(response_body):
         """Parse response from Daikin

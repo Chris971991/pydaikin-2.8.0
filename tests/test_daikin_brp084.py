@@ -795,7 +795,10 @@ async def test_get_resource_attempts_1_fails_fast(aresponses, client_session):
 
 @pytest.mark.asyncio
 async def test_update_status_single_attempt(aresponses, client_session):
-    """Polls never retry in-call: one failed request fails the poll."""
+    """Polls do not retry a device error in-call: one HTTP 500 fails the poll.
+
+    (v2.42.0: only FAST_CONNECTION_ERRORS, a dead socket, get one retry.)
+    """
     aresponses.add(
         path_pattern="/dsiot/multireq",
         method_pattern="POST",

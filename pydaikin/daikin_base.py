@@ -36,6 +36,12 @@ RETRYABLE_EXCEPTIONS = (
     asyncio.TimeoutError,
 )
 
+# v2.42.0: failures that mean "this socket is dead", not "the device is slow".
+# A retry costs one fresh connection, not another 20s timeout, so polls retry
+# these once while keeping a single attempt for everything else (timeouts
+# would otherwise double the poll budget on a slow unit).
+FAST_CONNECTION_ERRORS = (ClientOSError, ServerDisconnectedError)
+
 
 def _redact(params: dict, headers: dict) -> tuple:
     """Return copies of params/headers with credentials masked for logging."""
@@ -64,6 +70,15 @@ class Appliance(DaikinPowerMixin):
     INFO_RESOURCES = []
 
     MAX_CONCURRENT_REQUESTS = 4
+
+    # v2.42.0: headers merged into every request on top of self.headers.
+    # Subclasses set {'Connection': 'close'} for units whose embedded web
+    # server drops idle keep-alive sockets (see DaikinBRP069).
+    EXTRA_REQUEST_HEADERS: dict = {}
+
+    # v2.42.0: minimum seconds between successful fetches of a resource.
+    # Resources not listed refresh on every poll (subject to the values TTL).
+    RESOURCE_MIN_INTERVAL: dict = {}
 
     @classmethod
     def daikin_to_human(cls, dimension, value):
@@ -130,6 +145,7 @@ class Appliance(DaikinPowerMixin):
         self.headers: dict = {}
         self._energy_consumption_history = defaultdict(list)
         self._last_rejected_ret: dict = {}
+        self._last_fetch_by_resource: dict = {}
         if session:
             self.device_ip = device_id
         else:
@@ -167,9 +183,14 @@ class Appliance(DaikinPowerMixin):
         raise NotImplementedError
 
     async def _retry_request(
-        self, attempt_coro_factory, *, attempts: int = 2, description: str = ""
+        self,
+        attempt_coro_factory,
+        *,
+        attempts: int = 2,
+        description: str = "",
+        retry_on: tuple = RETRYABLE_EXCEPTIONS,
     ):
-        """Run a request coroutine, retrying RETRYABLE_EXCEPTIONS with jitter.
+        """Run a request coroutine, retrying `retry_on` exceptions with jitter.
 
         Shared by Appliance._get_resource and DaikinBRP084._get_resource.
         Budget note: worst case PER REQUEST is attempts x 20s HTTP timeout
@@ -177,17 +198,15 @@ class Appliance(DaikinPowerMixin):
         requests (state fetch + set + post-set refresh), so the command-
         critical requests (fetch + set, attempts=2 each) stay under the
         HA integration's 60s wait_for except when the device genuinely
-        fails twice per request. Polls use attempts=1 — the coordinator's
-        10s cadence is the retry loop.
+        fails twice per request. Polls retry only FAST_CONNECTION_ERRORS
+        (v2.42.0); for timeouts the coordinator's 10s cadence is the retry.
         """
         attempts = max(1, attempts)
         last_exc = None
         for attempt in range(attempts):
             try:
                 return await attempt_coro_factory()
-            except (
-                RETRYABLE_EXCEPTIONS
-            ) as exc:  # pylint: disable=catching-non-exception
+            except retry_on as exc:  # pylint: disable=catching-non-exception
                 last_exc = exc
                 if attempt + 1 < attempts:
                     _LOGGER.debug(
@@ -201,7 +220,12 @@ class Appliance(DaikinPowerMixin):
         raise last_exc
 
     async def _get_resource(
-        self, path: str, params: Optional[dict] = None, *, attempts: int = 2
+        self,
+        path: str,
+        params: Optional[dict] = None,
+        *,
+        attempts: int = 2,
+        retry_on: tuple = RETRYABLE_EXCEPTIONS,
     ):
         """Make the http request."""
         if params is None:
@@ -221,6 +245,7 @@ class Appliance(DaikinPowerMixin):
             lambda: self._get_resource_once(path, params),
             attempts=attempts,
             description=f"{self.base_url}/{path}",
+            retry_on=retry_on,
         )
 
     async def _get_resource_once(self, path: str, params: dict):
@@ -236,7 +261,7 @@ class Appliance(DaikinPowerMixin):
                 async with self.session.get(
                     f'{self.base_url}/{path}',
                     params=params,
-                    headers=self.headers,
+                    headers={**self.headers, **self.EXTRA_REQUEST_HEADERS},
                     ssl=self.ssl_context,
                     timeout=timeout,
                 ) as response:
@@ -300,18 +325,35 @@ class Appliance(DaikinPowerMixin):
         """
         if resources is None:
             resources = self.get_info_resources()
+        now = datetime.now(timezone.utc)
+        never = datetime.min.replace(tzinfo=timezone.utc)
         resources = [
             resource
             for resource in resources
             if self.values.should_resource_be_updated(resource)
+            # v2.42.0: honour the per-resource minimum interval (energy stats
+            # on a BRP069 change hourly; polling them every 10s was half the
+            # load on a slow unit and most of its stale-socket failures)
+            and (
+                now - self._last_fetch_by_resource.get(resource, never)
+            ).total_seconds()
+            >= self.RESOURCE_MIN_INTERVAL.get(resource, 0)
         ]
         _LOGGER.debug("Updating %s", resources)
 
         # gather(return_exceptions=True) rather than TaskGroup: TaskGroup
         # cancels siblings on first failure, losing their results and hiding
         # total outages (cancelled tasks are absent from eg.exceptions).
+        # v2.42.0: attempts=2 but only for FAST_CONNECTION_ERRORS, so a dead
+        # pooled socket costs one reconnect instead of a failed poll, while a
+        # slow device still gets a single 20s attempt per resource.
         results = await asyncio.gather(
-            *(self._get_resource(resource, attempts=1) for resource in resources),
+            *(
+                self._get_resource(
+                    resource, attempts=2, retry_on=FAST_CONNECTION_ERRORS
+                )
+                for resource in resources
+            ),
             return_exceptions=True,
         )
 
@@ -342,6 +384,7 @@ class Appliance(DaikinPowerMixin):
                     )
                 continue
             self._last_rejected_ret.pop(resource, None)
+            self._last_fetch_by_resource[resource] = now
             self.values.update_by_resource(resource, result)
 
         if failures:

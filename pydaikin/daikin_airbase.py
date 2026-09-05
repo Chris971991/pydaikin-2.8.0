@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 from urllib.parse import quote, unquote
 
+from .daikin_base import RETRYABLE_EXCEPTIONS
 from .daikin_brp069 import DaikinBRP069
 from .exceptions import DaikinException
 
@@ -74,11 +75,18 @@ class DaikinAirBase(DaikinBRP069):
             self.values["model"] = "Airbase BRP15B61"
 
     async def _get_resource(
-        self, path: str, params: Optional[dict] = None, *, attempts: int = 2
+        self,
+        path: str,
+        params: Optional[dict] = None,
+        *,
+        attempts: int = 2,
+        retry_on: tuple = RETRYABLE_EXCEPTIONS,
     ):
         """Make the http request."""
         path = f"skyfi/{path}"
-        return await super()._get_resource(path, params, attempts=attempts)
+        return await super()._get_resource(
+            path, params, attempts=attempts, retry_on=retry_on
+        )
 
     @property
     def support_away_mode(self):

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from aiohttp import ClientSession
 
-from .daikin_base import Appliance
+from .daikin_base import FAST_CONNECTION_ERRORS, RETRYABLE_EXCEPTIONS, Appliance
 from .exceptions import DaikinException, DaikinRejectedValueError
 
 _LOGGER = logging.getLogger(__name__)
@@ -344,9 +344,11 @@ class DaikinBRP084(Appliance):
         }
 
         try:
-            # attempts=1: polls never retry in-call; the coordinator's 10s
-            # cadence is the retry loop.
-            response = await self._get_resource("", params=payload, attempts=1)
+            # v2.42.0: a dead pooled socket is retried once (one reconnect);
+            # a timeout is not (the coordinator's 10s cadence is that retry).
+            response = await self._get_resource(
+                "", params=payload, attempts=2, retry_on=FAST_CONNECTION_ERRORS
+            )
 
             if not response or 'responses' not in response:
                 raise DaikinException("Invalid response from device")
@@ -525,15 +527,20 @@ class DaikinBRP084(Appliance):
         )
 
     async def _get_resource(
-        self, path: str, params: Optional[Dict] = None, *, attempts: int = 2
+        self,
+        path: str,
+        params: Optional[Dict] = None,
+        *,
+        attempts: int = 2,
+        retry_on: tuple = RETRYABLE_EXCEPTIONS,
     ):
         """Make the HTTP request to the device, retrying transient errors.
 
         The retry loop (shared Appliance._retry_request) wraps the raw POST;
         only the FINAL exception is translated below, so retryable exception
-        types stay visible to the retry filter. update_status passes
-        attempts=1 (the coordinator's 10s cadence is the retry loop); command
-        paths keep the default attempts=2.
+        types stay visible to the retry filter. update_status retries only
+        FAST_CONNECTION_ERRORS once (v2.42.0; a timeout is left to the
+        coordinator's 10s cadence); command paths keep the default attempts=2.
         """
         # %s formatting is lazy: no serialization cost above DEBUG level.
         _LOGGER.debug("Calling: %s %s", self.url, params)
@@ -543,6 +550,7 @@ class DaikinBRP084(Appliance):
                 lambda: self._post_request(params),
                 attempts=attempts,
                 description=self.url,
+                retry_on=retry_on,
             )
         except asyncio.CancelledError:
             # Task was cancelled (e.g., by blueprint restart) - don't log as error

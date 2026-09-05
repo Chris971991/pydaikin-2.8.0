@@ -340,3 +340,147 @@ def test_show_sensors_empty_values(capsys):
     device = _make_device()
     device.show_sensors()  # must not raise on missing temperatures
     assert 'in_temp=n/a' in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# v2.42.0: stale keep-alive sockets on BRP069/072C (Connection: close, one
+# retry on fast connection errors, energy resources on a minimum interval)
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    status = 200
+
+    def __init__(self, body):
+        self._body = body
+        self.url = 'http://127.0.0.1/x'
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    async def text(self):
+        return self._body
+
+
+class _FakeSession:
+    """Records the kwargs of every GET and answers ret=OK,pow=1."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _FakeResponse('ret=OK,pow=1')
+
+
+@pytest.mark.asyncio
+async def test_brp069_requests_send_connection_close():
+    """Every BRP069-family GET carries Connection: close on top of self.headers."""
+    session = _FakeSession()
+    device = DaikinBRP069('127.0.0.1', session=session)
+    device.headers = {'X-Daikin-uuid': 'abc'}
+    result = await device._get_resource('aircon/get_control_info')
+    assert result == {'pow': '1'}
+    _, kwargs = session.calls[0]
+    assert kwargs['headers']['Connection'] == 'close'
+    assert kwargs['headers']['X-Daikin-uuid'] == 'abc'
+    # the base class default is untouched (no header for other families)
+    from pydaikin.daikin_base import Appliance
+
+    assert Appliance.EXTRA_REQUEST_HEADERS == {}
+
+
+@pytest.mark.asyncio
+async def test_update_status_retries_fast_connection_error_once(monkeypatch):
+    """A dead pooled socket costs one reconnect, not a failed poll."""
+    from aiohttp.client_exceptions import ServerDisconnectedError
+
+    from pydaikin import daikin_base
+
+    monkeypatch.setattr(daikin_base.random, 'uniform', lambda a, b: 0)
+    device = _make_device()
+    calls = []
+
+    async def flaky_once(path, params):
+        calls.append(path)
+        if calls.count(path) == 1 and path == 'aircon/get_control_info':
+            raise ServerDisconnectedError()
+        return {
+            'aircon/get_sensor_info': {'htemp': '22'},
+            'aircon/get_control_info': {'pow': '1', 'mode': '3'},
+        }[path]
+
+    monkeypatch.setattr(device, '_get_resource_once', flaky_once)
+    await device.update_status()  # must NOT raise
+    assert device.values['pow'] == '1'
+    assert device.values['htemp'] == '22'
+    assert calls.count('aircon/get_control_info') == 2
+    assert calls.count('aircon/get_sensor_info') == 1
+
+
+@pytest.mark.asyncio
+async def test_update_status_timeout_is_not_retried(monkeypatch):
+    """A slow device still gets exactly one 20s attempt per resource."""
+    device = _make_device()
+    calls = []
+
+    async def slow(path, params):
+        calls.append(path)
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(device, '_get_resource_once', slow)
+    with pytest.raises(asyncio.TimeoutError):
+        await device.update_status()
+    assert calls.count('aircon/get_control_info') == 1
+    assert calls.count('aircon/get_sensor_info') == 1
+
+
+@pytest.mark.asyncio
+async def test_update_status_honours_resource_min_interval(monkeypatch):
+    """A resource with a minimum interval is skipped until it has elapsed."""
+    from datetime import datetime, timedelta, timezone
+
+    device = _make_device()
+    monkeypatch.setattr(
+        device, 'RESOURCE_MIN_INTERVAL', {'aircon/get_control_info': 60}
+    )
+    calls = []
+
+    async def fake_get_resource(resource, *args, **kwargs):
+        calls.append(resource)
+        return {
+            'aircon/get_sensor_info': {'htemp': '22'},
+            'aircon/get_control_info': {'pow': '1', 'mode': '3'},
+        }[resource]
+
+    monkeypatch.setattr(device, '_get_resource', fake_get_resource)
+    await device.update_status()
+    assert sorted(calls) == ['aircon/get_control_info', 'aircon/get_sensor_info']
+
+    # defeat the values TTL skip so only the interval decides
+    calls.clear()
+    device.values._last_update_by_resource.clear()
+    await device.update_status()
+    assert calls == ['aircon/get_sensor_info']
+
+    # interval elapsed -> fetched again
+    calls.clear()
+    device.values._last_update_by_resource.clear()
+    device._last_fetch_by_resource['aircon/get_control_info'] = datetime.now(
+        timezone.utc
+    ) - timedelta(seconds=61)
+    await device.update_status()
+    assert sorted(calls) == ['aircon/get_control_info', 'aircon/get_sensor_info']
+
+
+def test_brp069_energy_resources_have_min_interval():
+    assert DaikinBRP069.RESOURCE_MIN_INTERVAL == {
+        'aircon/get_day_power_ex': 60,
+        'aircon/get_week_power': 60,
+    }
