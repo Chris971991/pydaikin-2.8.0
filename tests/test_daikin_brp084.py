@@ -65,8 +65,16 @@ def make_status_response(
     include_humidity=True,
     adr_0200_failed=False,
     adp_i_failed=False,
+    include_toggles=False,
+    powerful="00",
+    econo="00",
 ):
-    """Build a full multireq status response body."""
+    """Build a full multireq status response body.
+
+    include_toggles adds the v2.41.0 feature-toggle nodes (indoor e_3003
+    comfort/econo, outdoor e_3002 outdoor_quiet/powerful); off by default so
+    the pre-2.41.0 shape stays available for the degradation tests.
+    """
     e3001 = [{"pn": "p_01", "pv": mode}] + list(mode_nodes)
     a00b = [{"pn": "p_01", "pv": "18"}]  # Room temp (24°C)
     if include_humidity:
@@ -113,6 +121,21 @@ def make_status_response(
             },
             "rsc": 2000,
         }
+
+    if include_toggles:
+        adr_0100_entry["pc"]["pch"][0]["pch"].append(
+            {
+                "pn": "e_3003",
+                "pch": [{"pn": "p_1D", "pv": "00"}, {"pn": "p_24", "pv": econo}],
+            }
+        )
+        if not adr_0200_failed:
+            adr_0200_entry["pc"]["pch"][0]["pch"].append(
+                {
+                    "pn": "e_3002",
+                    "pch": [{"pn": "p_3D", "pv": "00"}, {"pn": "p_44", "pv": powerful}],
+                }
+            )
 
     week_power_entry = {
         "fr": WEEK_POWER,
@@ -810,3 +833,143 @@ async def test_timeout_translated_after_final_attempt(client_session):
     message = str(excinfo.value)
     assert message == f"Network timeout communicating with device at {device.device_ip}"
     assert 'timeout' in message
+
+
+# --- v2.41.0: feature toggles (Powerful / Econo / Comfort / Outdoor quiet) ---
+
+
+@pytest.mark.asyncio
+async def test_feature_toggles_parsed_and_adv(aresponses, client_session):
+    """Toggle nodes are read into values; 'adv' mirrors the active mode."""
+    add_json_route(
+        aresponses, make_status_response(include_toggles=True, powerful="01")
+    )
+    device = DaikinBRP084('ip', session=client_session)
+    await device.init()
+
+    assert device.values['powerful'] == 'on'
+    assert device.values['econo'] == 'off'
+    assert device.values['comfort'] == 'off'
+    assert device.values['outdoor_quiet'] == 'off'
+    assert device.values['adv'] == 'powerful'
+    # Presets deliberately stay hidden until the write path is proven on
+    # this hardware (outdoor write rejected on BRP084 model 2E51).
+    assert not device.support_advanced_modes
+    assert device.support_powerful_mode
+    assert device.powerful_mode == 'on'
+    # represent() is what the HA integration reads for presets
+    assert 'powerful' in device.represent('adv')[1]
+
+
+@pytest.mark.asyncio
+async def test_feature_toggles_absent_degrade(aresponses, client_session):
+    """A model without the toggle nodes reports no advanced-mode support."""
+    add_json_route(aresponses, make_status_response())
+    device = DaikinBRP084('ip', session=client_session)
+    await device.init()
+
+    assert 'powerful' not in device.values
+    assert not device.support_advanced_modes
+    assert not device.support_powerful_mode
+    assert device.values['adv'] == ''
+
+
+@pytest.mark.asyncio
+async def test_set_powerful_builds_outdoor_request(aresponses, client_session):
+    """set_powerful_mode('on') writes outdoor e_3002/p_44 = 01, then refreshes."""
+    add_json_route(aresponses, make_status_response(include_toggles=True))  # init
+    recorded = []
+    add_recording_route(aresponses, recorded, rsc_response(2004))  # the write
+    add_json_route(
+        aresponses, make_status_response(include_toggles=True, powerful="01")
+    )  # trailing refresh
+
+    device = DaikinBRP084('ip', session=client_session)
+    await device.init()
+    await device.set_powerful_mode('on')
+
+    assert len(recorded) == 1
+    leaves = collect_leaves(recorded[0])
+    assert ("e_3002", "p_44", "01") in leaves
+    assert recorded[0]["requests"][0]["to"] == ADR_0200
+    assert device.powerful_mode == 'on'
+    aresponses.assert_all_requests_matched()
+    aresponses.assert_no_unused_routes()
+
+
+@pytest.mark.asyncio
+async def test_powerful_clears_active_econo(aresponses, client_session):
+    """Turning Powerful on also switches off an active Econo (hardware rule)."""
+    add_json_route(aresponses, make_status_response(include_toggles=True, econo="01"))
+    recorded = []
+    add_recording_route(aresponses, recorded, rsc_response(2004))
+    add_json_route(
+        aresponses, make_status_response(include_toggles=True, powerful="01")
+    )
+
+    device = DaikinBRP084('ip', session=client_session)
+    await device.init()
+    assert device.econo_mode == 'on'
+    await device.set({'powerful': 'on'})
+
+    leaves = collect_leaves(recorded[0])
+    assert ("e_3002", "p_44", "01") in leaves
+    assert ("e_3003", "p_24", "00") in leaves
+
+
+@pytest.mark.asyncio
+async def test_set_advanced_mode_routes_to_toggle(aresponses, client_session):
+    """The BRP069-compatible entry point drives the same toggle path."""
+    add_json_route(
+        aresponses, make_status_response(include_toggles=True, powerful="01")
+    )
+    recorded = []
+    add_recording_route(aresponses, recorded, rsc_response(2004))
+    add_json_route(aresponses, make_status_response(include_toggles=True))
+
+    device = DaikinBRP084('ip', session=client_session)
+    await device.init()
+    await device.set_advanced_mode('powerful', 'off')
+
+    assert ("e_3002", "p_44", "00") in collect_leaves(recorded[0])
+    assert device.powerful_mode == 'off'
+
+
+@pytest.mark.asyncio
+async def test_set_advanced_mode_unknown_is_ignored(client_session, caplog):
+    """Modes that do not exist on 2.8.0 (streamer) are logged, not sent."""
+    device = DaikinBRP084('ip', session=client_session)
+    with caplog.at_level(logging.DEBUG):
+        await device.set_advanced_mode('streamer', 'on')
+    assert "not supported" in caplog.text
+
+
+def test_handle_feature_toggles_unit(caplog):
+    """No-HTTP check of the toggle handler: values, raw pass-through, exclusion."""
+    device = make_device()
+
+    # human value
+    requests = []
+    device._handle_feature_toggles({'powerful': 'on'}, requests)
+    assert [(r.name, r.value, r.to) for r in requests] == [("p_44", "01", ADR_0200)]
+
+    # raw value passes through unchanged
+    requests = []
+    device._handle_feature_toggles({'econo': '01'}, requests)
+    assert [(r.name, r.value) for r in requests] == [("p_24", "01")]
+
+    # trio member on clears an active powerful
+    device.values['powerful'] = 'on'
+    requests = []
+    device._handle_feature_toggles({'comfort': 'on'}, requests)
+    assert sorted((r.name, r.value) for r in requests) == [
+        ("p_1D", "01"),
+        ("p_44", "00"),
+    ]
+
+    # nonsense value is skipped with a warning, nothing sent
+    requests = []
+    with caplog.at_level(logging.WARNING):
+        device._handle_feature_toggles({'powerful': 'maybe'}, requests)
+    assert requests == []
+    assert "toggle skipped" in caplog.text

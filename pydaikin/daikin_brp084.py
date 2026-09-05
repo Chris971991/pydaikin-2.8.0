@@ -1,5 +1,6 @@
 """Pydaikin appliance, represent a Daikin BRP device with firmware 2.8.0."""
 
+# pylint: disable=too-many-lines
 import asyncio
 from dataclasses import dataclass, field
 import logging
@@ -71,13 +72,14 @@ class DaikinRequest:
         return payload
 
 
-# pylint: disable=abstract-method
+# pylint: disable=abstract-method,too-many-public-methods
 class DaikinBRP084(Appliance):
     """Daikin class for BRP devices with firmware 2.8.0."""
 
     # Base path constants for reducing duplication
     _E_1002_BASE = ["/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002"]
     _E_1002_E_3001_BASE = _E_1002_BASE + ["e_3001"]
+    _E_1002_E_3003_BASE = _E_1002_BASE + ["e_3003"]
     _E_1003_BASE = ["/dsiot/edge/adr_0200.dgc_status", "dgc_status", "e_1003"]
     _ENERGY_BASE = ["/dsiot/edge/adr_0100.i_power.week_power", "week_power"]
 
@@ -91,6 +93,16 @@ class DaikinBRP084(Appliance):
         "outdoor_temp": _E_1003_BASE + ["e_A00D", "p_01"],
         "mac_address": ["/dsiot/edge.adp_i", "adp_i", "mac"],
         "model": _E_1002_BASE + ["e_A001", "p_0D"],
+        # v2.41.0: on/off feature toggles, ported from upstream pydaikin 2.19.x.
+        # Powerful verified on this house's BRP084 on 2026-09-05: pressing
+        # Powerful on the remote flipped outdoor e_3002/p_44 00 -> 01 (and the
+        # indoor status group e_A006), while nothing in e_3001 changed. The unit
+        # auto-cancels Powerful after ~20 minutes. Powerful and the trio
+        # {comfort, econo, outdoor_quiet} are mutually exclusive in hardware.
+        "comfort": _E_1002_E_3003_BASE + ["p_1D"],
+        "econo": _E_1002_E_3003_BASE + ["p_24"],
+        "outdoor_quiet": _E_1003_BASE + ["e_3002", "p_3D"],
+        "powerful": _E_1003_BASE + ["e_3002", "p_44"],
         # Mode-specific paths for temperature settings
         "temp_settings": {
             "cool": _E_1002_E_3001_BASE + ["p_02"],
@@ -166,6 +178,11 @@ class DaikinBRP084(Appliance):
             '0': 'off',
             '1': 'on',
         },
+        # v2.41.0 feature toggles: raw '00'/'01' <-> 'off'/'on'
+        'comfort': {'00': 'off', '01': 'on'},
+        'econo': {'00': 'off', '01': 'on'},
+        'outdoor_quiet': {'00': 'off', '01': 'on'},
+        'powerful': {'00': 'off', '01': 'on'},
     }
 
     # Mapping between the values from firmware 2.8.0 to traditional API values
@@ -195,6 +212,10 @@ class DaikinBRP084(Appliance):
 
     REVERSE_MODE_MAP = {v: k for k, v in MODE_MAP.items()}
     REVERSE_FAN_MODE_MAP = {v: k for k, v in FAN_MODE_MAP.items()}
+
+    # v2.41.0: on/off feature toggles handled together (they share the
+    # hardware mutual-exclusion rule, see _handle_feature_toggles).
+    POWER_TOGGLES = ('comfort', 'econo', 'outdoor_quiet', 'powerful')
 
     INFO_RESOURCES = []
 
@@ -460,6 +481,9 @@ class DaikinBRP084(Appliance):
             # Get swing mode
             self.values['f_dir'] = self.get_swing_state(response)
 
+            # v2.41.0: on/off feature toggles (powerful/econo/comfort/quiet)
+            self._extract_feature_toggles(response)
+
             # Get energy data
             try:
                 self.values['today_runtime'] = self.find_value_by_pn(
@@ -477,6 +501,28 @@ class DaikinBRP084(Appliance):
         except DaikinException as e:
             _LOGGER.error("Error extracting values: %s", e)
             raise
+
+    def _extract_feature_toggles(self, response):
+        """Read the v2.41.0 on/off feature toggles into values.
+
+        Each read is guarded so a model that lacks a node simply leaves that
+        key unset (and the matching support_* property False) instead of
+        failing the whole status update. 'adv' mirrors the BRP069
+        advanced-mode string so the HA integration's preset logic
+        ('powerful' in represent('adv')[1]) works unchanged: the names of
+        the active modes, space-joined, empty when none is active.
+        """
+        for key in self.POWER_TOGGLES:
+            try:
+                raw = self.find_value_by_pn(response, *self.get_path(key))
+                self.values[key] = self.TRANSLATIONS[key].get(raw, 'off')
+            except DaikinException:
+                pass
+        self.values['adv'] = ' '.join(
+            key
+            for key in ('powerful', 'econo')
+            if self.values.get(key, invalidate=False) == 'on'
+        )
 
     async def _get_resource(
         self, path: str, params: Optional[Dict] = None, *, attempts: int = 2
@@ -698,6 +744,50 @@ class DaikinBRP084(Appliance):
             ),
         )
 
+    def _handle_feature_toggles(self, settings, requests):
+        """Handle comfort/econo/outdoor_quiet/powerful on-off toggles.
+
+        v2.41.0, ported from upstream pydaikin. Each accepts human ('on'/'off')
+        or raw ('01'/'00') values. Enforces the hardware mutual-exclusion from
+        the unit's manual: Powerful and {Comfort, Econo, Outdoor Quiet} cannot
+        be active at the same time, so enabling one side clears the other
+        (mirroring the remote's last-button-pressed-wins behaviour).
+        """
+        requested = {}
+        for key in self.POWER_TOGGLES:
+            if key not in settings:
+                continue
+            raw = self.human_to_daikin(key, settings[key])
+            if raw in ('00', '01'):
+                requested[key] = raw
+            else:
+                _LOGGER.warning(
+                    "Unsupported %s value %r; toggle skipped", key, settings[key]
+                )
+
+        if not requested:
+            return
+
+        trio = ('comfort', 'econo', 'outdoor_quiet')
+        # Turning Powerful on clears any currently-active trio member...
+        if requested.get('powerful') == '01':
+            for key in trio:
+                if (
+                    self.values.get(key, invalidate=False) == 'on'
+                    and key not in requested
+                ):
+                    requested[key] = '00'
+        # ...and turning on any trio member clears an active Powerful.
+        if any(requested.get(key) == '01' for key in trio):
+            if (
+                self.values.get('powerful', invalidate=False) == 'on'
+                and 'powerful' not in requested
+            ):
+                requested['powerful'] = '00'
+
+        for key, raw in requested.items():
+            self.add_request(requests, self.get_path(key), raw)
+
     async def set(self, settings, expected_pow=None):
         # pylint: disable=too-many-branches
         """Set settings on Daikin device.
@@ -755,6 +845,7 @@ class DaikinBRP084(Appliance):
         self._handle_power_setting(settings, requests)
         self._handle_fan_setting(settings, requests, target_mode)
         self._handle_swing_setting(settings, requests, target_mode)
+        self._handle_feature_toggles(settings, requests)
 
         if requests:
             request_payload = DaikinRequest(requests).serialize()
@@ -832,10 +923,18 @@ class DaikinBRP084(Appliance):
         """Set holiday mode."""
         _LOGGER.debug("Holiday mode not supported in firmware 2.8.0")
 
-    # pylint: disable=unused-argument
     async def set_advanced_mode(self, mode, value):
-        """Set advanced mode."""
-        _LOGGER.debug("Advanced mode not supported in firmware 2.8.0")
+        """Set an advanced mode ('powerful', 'econo', 'comfort', 'outdoor_quiet').
+
+        v2.41.0: BRP069-compatible entry point used by the HA integration's
+        preset logic (boost -> 'powerful', eco -> 'econo'). `value` is
+        'on'/'off'. Anything else (e.g. 'streamer') is not available on
+        firmware 2.8.0 and is logged and ignored.
+        """
+        if mode in self.POWER_TOGGLES:
+            await self.set({mode: value})
+            return
+        _LOGGER.debug("Advanced mode %r not supported in firmware 2.8.0", mode)
 
     @property
     def support_away_mode(self) -> bool:
@@ -844,8 +943,78 @@ class DaikinBRP084(Appliance):
 
     @property
     def support_advanced_modes(self) -> bool:
-        """Advanced mode not supported in firmware 2.8.0"""
+        """Advanced-mode PRESETS stay hidden on firmware 2.8.0 for now.
+
+        v2.41.0: the read side works (see powerful_mode / econo_mode) but the
+        WRITE path is hardware-dependent. Upstream verified the outdoor
+        e_3002/p_44 write on a BRP069C4x/Alira; on this house's BRP084
+        (model 2E51, 2026-09-05) that write is rejected (rsc 4000) and a
+        write to the indoor status field e_A006/p_13 is accepted but
+        overwritten by the unit within a minute. Exposing a 'boost' preset
+        that errors when selected is worse than no preset, so this stays
+        False until a write path is proven on this hardware. The set_*
+        methods remain callable and raise DaikinRejectedValueError clearly.
+        """
         return False
+
+    async def set_powerful_mode(self, mode):
+        """Enable or disable Powerful mode ('on'/'off').
+
+        The unit auto-cancels Powerful after ~20 minutes on its own.
+        """
+        await self.set({'powerful': mode})
+
+    @property
+    def support_powerful_mode(self) -> bool:
+        """Return True if the device exposes Powerful mode."""
+        return 'powerful' in self.values
+
+    @property
+    def powerful_mode(self) -> Optional[str]:
+        """Return current Powerful state ('on'/'off')."""
+        return self.values.get('powerful', invalidate=False)
+
+    async def set_econo_mode(self, mode):
+        """Enable or disable Econo mode ('on'/'off')."""
+        await self.set({'econo': mode})
+
+    @property
+    def support_econo_mode(self) -> bool:
+        """Return True if the device exposes Econo mode."""
+        return 'econo' in self.values
+
+    @property
+    def econo_mode(self) -> Optional[str]:
+        """Return current Econo state ('on'/'off')."""
+        return self.values.get('econo', invalidate=False)
+
+    async def set_comfort_mode(self, mode):
+        """Enable or disable comfort airflow ('on'/'off')."""
+        await self.set({'comfort': mode})
+
+    @property
+    def support_comfort_mode(self) -> bool:
+        """Return True if the device exposes comfort airflow."""
+        return 'comfort' in self.values
+
+    @property
+    def comfort_mode(self) -> Optional[str]:
+        """Return current comfort airflow state ('on'/'off')."""
+        return self.values.get('comfort', invalidate=False)
+
+    async def set_outdoor_quiet_mode(self, mode):
+        """Enable or disable outdoor-unit quiet mode ('on'/'off')."""
+        await self.set({'outdoor_quiet': mode})
+
+    @property
+    def support_outdoor_quiet_mode(self) -> bool:
+        """Return True if the device exposes outdoor-unit quiet mode."""
+        return 'outdoor_quiet' in self.values
+
+    @property
+    def outdoor_quiet_mode(self) -> Optional[str]:
+        """Return current outdoor-unit quiet state ('on'/'off')."""
+        return self.values.get('outdoor_quiet', invalidate=False)
 
     @property
     def support_zone_count(self) -> bool:
