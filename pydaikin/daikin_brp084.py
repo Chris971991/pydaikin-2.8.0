@@ -4,9 +4,11 @@
 import asyncio
 from dataclasses import dataclass, field
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from aiohttp import ClientSession
+from aiohttp.client_exceptions import ServerTimeoutError
 
 from .daikin_base import FAST_CONNECTION_ERRORS, RETRYABLE_EXCEPTIONS, Appliance
 from .exceptions import DaikinException, DaikinRejectedValueError
@@ -217,6 +219,17 @@ class DaikinBRP084(Appliance):
     # hardware mutual-exclusion rule, see _handle_feature_toggles).
     POWER_TOGGLES = ('comfort', 'econo', 'outdoor_quiet', 'powerful')
 
+    # v2.43.0: a poll detects a lost request in 10 s and retries once. The unit
+    # answers a full-tree read in ~1.4 s, so a 20 s wait meant the request had
+    # vanished (five a day on the Living Room BRP084, each a failed poll the
+    # coordinator had to tolerate). Commands keep the 20 s budget. The energy
+    # counters change hourly: fetched at most every 60 s, not in every poll.
+    POLL_TIMEOUT = 10
+    COMMAND_TIMEOUT = 20
+    POLL_RETRY_ON = FAST_CONNECTION_ERRORS + (ServerTimeoutError, asyncio.TimeoutError)
+    ENERGY_MIN_INTERVAL = 60
+    _last_energy_fetch: float = 0.0
+
     INFO_RESOURCES = []
 
     def get_path(self, *keys):
@@ -329,29 +342,41 @@ class DaikinBRP084(Appliance):
         await self.update_status()
 
     async def update_status(self, resources=None):
-        # pylint: disable=too-many-branches,too-many-statements
+        # pylint: disable=too-many-branches,too-many-statements,too-many-locals
         """Update device status."""
-        payload = {
-            "requests": [
-                {"op": 2, "to": "/dsiot/edge/adr_0100.dgc_status?filter=pv,pt,md"},
-                {"op": 2, "to": "/dsiot/edge/adr_0200.dgc_status?filter=pv,pt,md"},
+        now = time.monotonic()
+        want_energy = (now - self._last_energy_fetch) >= self.ENERGY_MIN_INTERVAL
+        requests = [
+            {"op": 2, "to": "/dsiot/edge/adr_0100.dgc_status?filter=pv,pt,md"},
+            {"op": 2, "to": "/dsiot/edge/adr_0200.dgc_status?filter=pv,pt,md"},
+        ]
+        if want_energy:
+            requests.append(
                 {
                     "op": 2,
                     "to": "/dsiot/edge/adr_0100.i_power.week_power?filter=pv,pt,md",
-                },
-                {"op": 2, "to": "/dsiot/edge.adp_i"},
-            ]
-        }
+                }
+            )
+        requests.append({"op": 2, "to": "/dsiot/edge.adp_i"})
+        payload = {"requests": requests}
 
         try:
-            # v2.42.0: a dead pooled socket is retried once (one reconnect);
-            # a timeout is not (the coordinator's 10s cadence is that retry).
+            # v2.42.0: a dead pooled socket is retried once (one reconnect).
+            # v2.43.0: so is a lost request, after POLL_TIMEOUT instead of the
+            # command budget; worst case 2 x 10 s + jitter, under the
+            # coordinator's 90 s ceiling.
             response = await self._get_resource(
-                "", params=payload, attempts=2, retry_on=FAST_CONNECTION_ERRORS
+                "",
+                params=payload,
+                attempts=2,
+                retry_on=self.POLL_RETRY_ON,
+                timeout=self.POLL_TIMEOUT,
             )
 
             if not response or 'responses' not in response:
                 raise DaikinException("Invalid response from device")
+            if want_energy:
+                self._last_energy_fetch = now
         except DaikinException:
             # Re-raise DaikinException as-is (includes timeouts, which
             # _get_resource already translates to DaikinException).
@@ -486,19 +511,21 @@ class DaikinBRP084(Appliance):
             # v2.41.0: on/off feature toggles (powerful/econo/comfort/quiet)
             self._extract_feature_toggles(response)
 
-            # Get energy data
-            try:
-                self.values['today_runtime'] = self.find_value_by_pn(
-                    response, *self.get_path("energy", "today_runtime")
-                )
+            # Get energy data (v2.43.0: only when this poll asked for it; the
+            # previous values stay in place on the polls in between)
+            if want_energy:
+                try:
+                    self.values['today_runtime'] = self.find_value_by_pn(
+                        response, *self.get_path("energy", "today_runtime")
+                    )
 
-                energy_data = self.find_value_by_pn(
-                    response, *self.get_path("energy", "weekly_data")
-                )
-                if isinstance(energy_data, list) and len(energy_data) > 0:
-                    self.values['datas'] = '/'.join(map(str, energy_data))
-            except DaikinException:
-                pass
+                    energy_data = self.find_value_by_pn(
+                        response, *self.get_path("energy", "weekly_data")
+                    )
+                    if isinstance(energy_data, list) and len(energy_data) > 0:
+                        self.values['datas'] = '/'.join(map(str, energy_data))
+                except DaikinException:
+                    pass
 
         except DaikinException as e:
             _LOGGER.error("Error extracting values: %s", e)
@@ -526,13 +553,14 @@ class DaikinBRP084(Appliance):
             if self.values.get(key, invalidate=False) == 'on'
         )
 
-    async def _get_resource(
+    async def _get_resource(  # pylint: disable=too-many-arguments
         self,
         path: str,
         params: Optional[Dict] = None,
         *,
         attempts: int = 2,
         retry_on: tuple = RETRYABLE_EXCEPTIONS,
+        timeout: Optional[int] = None,
     ):
         """Make the HTTP request to the device, retrying transient errors.
 
@@ -546,8 +574,16 @@ class DaikinBRP084(Appliance):
         _LOGGER.debug("Calling: %s %s", self.url, params)
 
         try:
+            # Only pass the timeout through when one was asked for: callers
+            # (and tests) that replace _post_request with a one-argument
+            # coroutine keep working, and commands keep COMMAND_TIMEOUT.
+            attempt = (
+                (lambda: self._post_request(params, timeout=timeout))
+                if timeout is not None
+                else (lambda: self._post_request(params))
+            )
             return await self._retry_request(
-                lambda: self._post_request(params),
+                attempt,
                 attempts=attempts,
                 description=self.url,
                 retry_on=retry_on,
@@ -582,15 +618,21 @@ class DaikinBRP084(Appliance):
             )
             raise
 
-    async def _post_request(self, params: Optional[Dict]):
-        """Single attempt of the multireq POST."""
+    async def _post_request(
+        self, params: Optional[Dict], timeout: Optional[int] = None
+    ):
+        """Single attempt of the multireq POST.
+
+        `timeout` defaults to COMMAND_TIMEOUT (20 s, sized for slow or congested
+        networks); polls pass POLL_TIMEOUT (v2.43.0).
+        """
         async with self.request_semaphore:
             async with self.session.post(
                 self.url,
                 json=params,
                 headers=self.headers,
                 ssl=self.ssl_context,
-                timeout=20,  # Match base class timeout for slow/congested networks
+                timeout=timeout if timeout is not None else self.COMMAND_TIMEOUT,
             ) as response:
                 response.raise_for_status()
                 json_data = await response.json()

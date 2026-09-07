@@ -976,3 +976,91 @@ def test_handle_feature_toggles_unit(caplog):
         device._handle_feature_toggles({'powerful': 'maybe'}, requests)
     assert requests == []
     assert "toggle skipped" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# v2.43.0: polls detect a lost request in POLL_TIMEOUT and retry once; the
+# energy counters are fetched at most every ENERGY_MIN_INTERVAL seconds
+# ---------------------------------------------------------------------------
+
+
+def _status_dict():
+    body = make_status_response()
+    return json.loads(body) if isinstance(body, str) else body
+
+
+@pytest.mark.asyncio
+async def test_update_status_retries_lost_request_once(monkeypatch, client_session):
+    """A poll whose request vanishes (timeout) is retried once and succeeds."""
+    from pydaikin import daikin_base
+
+    monkeypatch.setattr(daikin_base.random, 'uniform', lambda a, b: 0)
+    device = DaikinBRP084('ip', session=client_session)
+    calls = []
+
+    async def flaky(params, timeout=None):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise asyncio.TimeoutError
+        return _status_dict()
+
+    device._post_request = flaky
+    await device.update_status()  # must NOT raise
+    assert len(calls) == 2
+    assert calls == [DaikinBRP084.POLL_TIMEOUT, DaikinBRP084.POLL_TIMEOUT]
+    assert device.values['pow'] == '1'  # pydaikin normalises '01' -> '1'
+
+
+@pytest.mark.asyncio
+async def test_update_status_two_lost_requests_fail(monkeypatch, client_session):
+    """Two lost requests in a row still fail the poll (the coordinator's tolerance takes it from there)."""
+    from pydaikin import daikin_base
+
+    monkeypatch.setattr(daikin_base.random, 'uniform', lambda a, b: 0)
+    device = DaikinBRP084('ip', session=client_session)
+    calls = []
+
+    async def dead(params, timeout=None):
+        calls.append(1)
+        raise asyncio.TimeoutError
+
+    device._post_request = dead
+    with pytest.raises(DaikinException) as excinfo:
+        await device.update_status()
+    assert len(calls) == 2
+    assert 'timeout' in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_commands_keep_the_command_timeout(client_session):
+    """A non-poll request (attempts default, no timeout given) uses COMMAND_TIMEOUT."""
+    device = DaikinBRP084('ip', session=client_session)
+    seen = []
+
+    async def ok(params, timeout=None):
+        seen.append(timeout)
+        return {"responses": [{"fr": "/x", "rsc": 2000}]}
+
+    device._post_request = ok
+    await device._get_resource('', params={"requests": []})
+    assert seen == [None]  # _post_request substitutes COMMAND_TIMEOUT for None
+
+
+@pytest.mark.asyncio
+async def test_update_status_energy_fetched_every_60s(client_session):
+    """The week_power request rides along at most once per ENERGY_MIN_INTERVAL."""
+    device = DaikinBRP084('ip', session=client_session)
+    seen = []
+
+    async def ok(params, timeout=None):
+        seen.append([r["to"] for r in params["requests"]])
+        return _status_dict()
+
+    device._post_request = ok
+    await device.update_status()
+    await device.update_status()
+    device._last_energy_fetch -= DaikinBRP084.ENERGY_MIN_INTERVAL + 1
+    await device.update_status()
+    has_energy = [any("week_power" in to for to in reqs) for reqs in seen]
+    assert has_energy == [True, False, True]
+    assert all(len(reqs) in (3, 4) for reqs in seen)
