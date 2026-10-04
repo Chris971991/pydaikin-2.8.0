@@ -561,10 +561,52 @@ class Appliance(DaikinPowerMixin):
         """Return True if the device has humidity sensor."""
         return self.humidity is not None
 
+    def _special_mode_bits(self) -> Optional[int]:
+        """Return the unit's special-mode capability mask, or None if unreported.
+
+        aircon/get_model_info carries en_spmode: bit 0 = powerful, bit 1 =
+        econo, bit 2 = streamer (Faikin's emulation of the same API builds it
+        that way). The BRP072C units in this house report en_spmode=0 while
+        still carrying an (empty) 'adv' field, and reject every
+        set_special_mode with ret=PARAM NG (2026-10-04), so 'adv' alone is
+        not proof of support.
+        """
+        try:
+            return int(self.values.get('en_spmode', invalidate=False))
+        except (TypeError, ValueError):
+            return None
+
     @property
     def support_advanced_modes(self) -> bool:
-        """Return True if the device supports advanced modes."""
-        return 'adv' in self.values
+        """Return True if the device supports any special mode."""
+        if 'adv' not in self.values:
+            return False
+        bits = self._special_mode_bits()
+        return bits is None or bits & 0b111 != 0
+
+    @property
+    def support_streamer_mode(self) -> bool:
+        """Return True if the device accepts the streamer special mode."""
+        if 'adv' not in self.values:
+            return False
+        bits = self._special_mode_bits()
+        return bits is None or bool(bits & 0b100)
+
+    @property
+    def support_powerful_mode(self) -> bool:
+        """Return True if the device accepts the powerful special mode."""
+        if 'adv' not in self.values:
+            return False
+        bits = self._special_mode_bits()
+        return bits is None or bool(bits & 0b001)
+
+    @property
+    def support_econo_mode(self) -> bool:
+        """Return True if the device accepts the econo special mode."""
+        if 'adv' not in self.values:
+            return False
+        bits = self._special_mode_bits()
+        return bits is None or bool(bits & 0b010)
 
     @property
     def support_compressor_frequency(self) -> bool:

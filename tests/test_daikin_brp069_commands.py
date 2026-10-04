@@ -332,3 +332,44 @@ async def test_set_streamer_success(aresponses, client_session):
     assert device.values['adv'] == '13'
     assert 'ret' not in device.values
     aresponses.assert_all_requests_matched()
+
+
+# --- v2.44.0: special-mode capability comes from en_spmode, not 'adv' -------
+
+
+@pytest.mark.parametrize(
+    "en_spmode, powerful, econo, streamer, any_mode",
+    [
+        (None, True, True, True, True),  # not reported: old behaviour ('adv' present)
+        ('0', False, False, False, False),  # this house's BRP072C units (2026-10-04)
+        ('1', True, False, False, True),
+        ('2', False, True, False, True),
+        ('4', False, False, True, True),
+        ('7', True, True, True, True),
+        ('junk', True, True, True, True),  # unparseable: fall back to 'adv'
+    ],
+)
+@pytest.mark.asyncio
+async def test_special_mode_support_from_en_spmode(
+    client_session, en_spmode, powerful, econo, streamer, any_mode
+):
+    """en_spmode bit 0 = powerful, bit 1 = econo, bit 2 = streamer."""
+    device = DaikinBRP069('127.0.0.1', session=client_session)
+    device.values['adv'] = ''
+    if en_spmode is not None:
+        device.values['en_spmode'] = en_spmode
+    assert device.support_powerful_mode is powerful
+    assert device.support_econo_mode is econo
+    assert device.support_streamer_mode is streamer
+    assert device.support_advanced_modes is any_mode
+
+
+@pytest.mark.asyncio
+async def test_special_mode_support_needs_adv(client_session):
+    """Without an 'adv' field no special mode is offered, whatever en_spmode says."""
+    device = DaikinBRP069('127.0.0.1', session=client_session)
+    device.values['en_spmode'] = '7'
+    assert not device.support_advanced_modes
+    assert not device.support_powerful_mode
+    assert not device.support_econo_mode
+    assert not device.support_streamer_mode
